@@ -1,0 +1,116 @@
+% 编译：xelatex simulation_methodology.tex
+\documentclass[UTF8,a4paper]{ctexart}
+\usepackage{amsmath,amssymb,booktabs,geometry}
+\usepackage{hyperref}
+\geometry{margin=2.5cm}
+\hypersetup{colorlinks=true,linkcolor=blue}
+
+\title{新能源车队调度仿真：建模思路、规模参数与得分含义}
+\author{党涵}
+\date{}
+
+\begin{document}
+\maketitle
+
+\section{总体思路}
+
+题目要求用\textbf{图结构}表示道路并完成\textbf{路径规划}，在动态到达的任务下进行车队调度。本实现采用以下抽象层次。
+
+\subsection{道路网络（图模型）}
+\begin{itemize}
+  \item 将城市抽象为 $r\times c$ 的\textbf{网格图}：每个交叉点为一个顶点，四邻连接（上下左右）。
+  \item 边权为相邻顶点间的\textbf{欧氏距离}（网格轴相邻边权为 $1$）。
+  \item 顶点按行主序编号，$0$ 号节点为\textbf{中央仓库（车场）}。
+  \item 使用 \textbf{Floyd--Warshall} 算法预处理\textbf{全对最短路}，调度时直接查表得到任意两点间最短距离。
+\end{itemize}
+
+\subsection{时间推进与任务生成}
+\begin{itemize}
+  \item 仿真时间为离散时间步，步长 $\Delta t = 0.5$。
+  \item 每个时间步以概率 $p_{\mathrm{spawn}} \cdot \Delta t$ 独立生成一个新任务。
+  \item 每个任务包含：产生时刻、目标顶点、货物重量（区间内均匀随机）、截止时间（产生时刻加上区间内均匀随机的裕量）。
+\end{itemize}
+
+\subsection{车队与能耗}
+\begin{itemize}
+  \item 每辆车有\textbf{电量上限} $B_{\max}$、\textbf{载重上限} $L_{\max}$；任务完成后载重释放。
+  \item 行驶距离 $d$ 的能耗近似为 $E(d)=\rho\cdot d$，其中 $\rho$ 为\textbf{单位距离能耗}。
+  \item 车速用于将距离换算为行驶时间：$t_{\mathrm{travel}} = d / v$。
+\end{itemize}
+
+\subsection{调度策略：最大任务（重量）优先}
+在仓库且空闲的车辆，在待分配任务集合上做贪心选择：
+\begin{enumerate}
+  \item 仅考虑已出现、未过期、且\textbf{当前载重加上该任务重量不超过 $L_{\max}$} 的任务；
+  \item 在其中选取\textbf{货物重量最大}的任务。
+\end{enumerate}
+送完货后车辆先\textbf{回仓}再接受下一单。
+
+\subsection{充电与排队}
+\begin{itemize}
+  \item 若从当前位置沿最短路直达任务点（或回仓）的能耗超过当前电量，则先到\textbf{图距离最近}的充电站，充电后再继续路段。
+  \item 每个充电站有有限个\textbf{并发槽位}（代码中为 $2$）。充电用时间区间 $[t_{\mathrm{start}},t_{\mathrm{end}})$ 预约；槽位已满时推进到\textbf{最早能开始充电的时刻}，体现\textbf{排队与负荷}。
+\end{itemize}
+
+\section{各规模场景的具体数量}
+
+四组场景除下表所列参数外，还共享：
+\[
+B_{\max}=100,\quad L_{\max}=50,\quad \rho=0.8,\quad v=1.0,\quad P_{\mathrm{charge}}=15.0,
+\]
+\[
+\alpha_{\mathrm{early}}=2.0,\quad \alpha_{\mathrm{late}}=3.0,\quad \alpha_{d}=0.05.
+\]
+充电站每站点并发槽位数为 $2$。
+
+\begin{table}[htbp]
+  \centering
+  \caption{四种仿真规模的显式参数（与 \texttt{preset\_scenarios()} 一致）}
+  \small
+  \begin{tabular}{@{}lcccccccccc@{}}
+    \toprule
+    名称 & $r$ & $c$ & $|V|=rc$ & 车辆数 & 充电站数 & $T_{\mathrm{sim}}$ &
+    $p_{\mathrm{spawn}}$ & 重量区间 & 截止裕量区间 & \texttt{seed} \\
+    \midrule
+    SMALL      & 5  & 5  & 25   & 2 & 2 & 200 & 0.08 & $[1,8]$   & $[25,55]$ & 1 \\
+    MEDIUM     & 10 & 10 & 100  & 4 & 4 & 300 & 0.12 & $[1,15]$  & $[20,60]$ & 2 \\
+    LARGE      & 16 & 16 & 256  & 8 & 8 & 400 & 0.15 & $[2,25]$  & $[18,50]$ & 3 \\
+    XL\_STRESS & 20 & 20 & 400  & 6 & 5 & 350 & 0.22 & $[3,30]$  & $[12,35]$ & 4 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\noindent\textbf{说明：} $|V|$ 为顶点数；边数约为 $2rc-r-c$。XL\_STRESS 采用更高到达率、更紧截止裕量、相对较少车辆/充电站，用于压力测试。
+
+\section{最终得分的含义与计算公式}
+
+最终得分 $S$ 为\textbf{标量评价指标}，对应大作业中“完成越早、路径越短越高分，超时扣分”的定性要求。实现为\textbf{可加}形式。
+
+\subsection{已完成任务的贡献}
+设任务在 $t_{\mathrm{fin}}$ 完成，截止 $t_{\mathrm{dl}}$，重量 $w$，本任务相关行驶距离为 $d_{\mathrm{task}}$。
+\begin{equation}
+  \Delta S_{\mathrm{done}} =
+  \begin{cases}
+    \alpha_{\mathrm{early}}\, w - \alpha_{d}\, d_{\mathrm{task}}, & t_{\mathrm{fin}} \le t_{\mathrm{dl}},\\[0.5em]
+    -\alpha_{\mathrm{late}}\,(t_{\mathrm{fin}}-t_{\mathrm{dl}}) - \alpha_{d}\, d_{\mathrm{task}}, & t_{\mathrm{fin}} > t_{\mathrm{dl}}.
+  \end{cases}
+\end{equation}
+
+\subsection{未完成（过期）任务的惩罚}
+待分配任务在仿真中首次被发现已超过截止时间时记一次惩罚：
+\begin{equation}
+  \Delta S_{\mathrm{expired}} = -\alpha_{\mathrm{late}}\,(t-t_{\mathrm{dl}}).
+\end{equation}
+
+\subsection{如何解读 $S$}
+\begin{itemize}
+  \item $S$ \textbf{无绝对物理单位}，是人为设定的效用代理，用于同一套参数下比较策略或随机种子。
+  \item \textbf{越大越好}；大量过期或迟到时 $S$ 可显著为负（罚分主导）。
+  \item 若修改 $\alpha_{\mathrm{early}},\alpha_{\mathrm{late}},\alpha_{d}$，数值尺度会变，比较时需对齐系数。
+\end{itemize}
+
+\section{小结}
+
+网格图 $+$ 全对最短路、离散时间动态任务、最大重量优先贪心、充电站槽位与区间预约，以及按时奖励、迟到/过期惩罚、距离惩罚构成总分 $S$。与代码不一致处以 \texttt{fleet\_simulation.py} 为准。
+
+\end{document}
