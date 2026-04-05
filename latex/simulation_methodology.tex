@@ -38,15 +38,38 @@
   \item 车速用于将距离换算为行驶时间：$t_{\mathrm{travel}} = d / v$。
 \end{itemize}
 
-\subsection{调度策略：仓库多票装车 $+$ 最近邻配送顺序}
+\subsection{基线调度策略（\texttt{fleet\_simulation.py}）：仓库多票装车 $+$ 最近邻配送顺序}
 车辆\textbf{仅在仓库}且空闲时派发新的一批任务（代码中 \texttt{node} 为仓库且无在送批次）。模型假定\textbf{所有货物在仓库一次装车}，再沿路连续送票，\textbf{本批全部送完后}再执行回仓（与“每送一票必须先回仓”不同）。具体为：
 \begin{enumerate}
-  \item \textbf{装车（贪心）}：在待分配、已出现且未过期的任务中，按\textbf{重量从大到小}依次装入，直至再加一票会超过 $L_{\max}$，得到本趟\textbf{批次}（可多票）。
+  \item \textbf{装车（贪心）}：在待分配、已出现且未过期的任务中，按\textbf{重量从大到小}依次装入，直至再加一票会超过 $L_{\max}$，得到本趟\textbf{批次}（可多票）。同重量时排序顺序由实现细节决定（稳定排序下保持候选表原有次序）。
   \item \textbf{配送顺序（最近邻）}：以仓库为起点，在批次内反复选择\textbf{距当前位置图最短路最短}的下一配送点，直至排完访问序（启发式，非最优 TSP）。
   \item \textbf{电量可行性}：计算\textbf{仓库 $\to$ 各配送点（按上述顺序）$\to$ 回仓库} 的总路程能耗；若超过当前电量，则反复从批次中\textbf{去掉当前最轻的一票}并重新最近邻排序，直至总能耗不超过电量，或批次退化为\textbf{仅一票}（仍不足则允许经充电站补能，逻辑见下节）。
   \item \textbf{在途}：按访问序分段行驶；每一段均为“当前位置 $\to$ 下一配送点”，段内仍可采用途经充电站路径。每送完一票仅卸下该票重量；若尚有余票，则\textbf{从当前配送点直接}驶向下一点，无需回仓。
 \end{enumerate}
 代码中另保留单票选取函数 \texttt{pick\_task\_max\_weight}，便于与“只装一票”等策略做对比，主流程为 \texttt{pick\_batch\_greedy\_max\_weight}。
+
+\subsection{元启发式对比实现（\texttt{fleet\_metaheuristic.py}）}
+在\textbf{与基线相同的} \texttt{SimConfig}、任务生成随机种子及 \texttt{self.\_rng} 消费顺序下，通过子类 \texttt{MetaHeuristicFleetSimulator} 仅替换\textbf{装批平局规则}与\textbf{批次内访问序}；仿真主循环、充电与路径逻辑仍继承基类。元启发式内部随机数使用独立种子（\texttt{seed}+常数偏移），避免干扰任务流。
+
+\paragraph{装车（批次层面）}
+仍按\textbf{重量从大到小}再在载重内贪心装入，与基线结构一致；区别为\textbf{同重量}任务按\textbf{截止时间先后}（EDD），再按任务编号 \texttt{tid} 打破平局，对应 \texttt{pick\_batch\_weight\_then\_edd}。这样在不推翻“重货优先装满车”的前提下引入紧迫度信息。
+
+\paragraph{批次内路径优化（元启发式核心）}
+派发批次时记录当前仿真时刻 $t_0$，对批次内访问序 $\pi$ 定义\textbf{与总分系数对齐的代理代价}（用于优化，非仿真直接加分公式）：
+\begin{equation}
+  J(\pi) = \alpha_{d}\, D(\pi) + \alpha_{\mathrm{late}}\, L(\pi).
+\end{equation}
+其中 $D(\pi)$ 为\textbf{仓库 $\to$ 按 $\pi$ 依次送达各点 $\to$ 回仓库}的图最短路总里程（与电量检验所用回路长度一致）；$L(\pi)$ 为按 $\pi$ 顺序、以 $t_0$ 为起点用行驶时间累加到达各点时，\textbf{正迟到时间}之和，即对每个任务取 $\max\{0,\,t_{\mathrm{arr}}-t_{\mathrm{dl}}\}$ 再求和（$t_{\mathrm{arr}}$ 由连续最短路距离除以车速 $v$ 递推）。
+
+\paragraph{算法流程}
+\begin{itemize}
+  \item 若批内任务数 $n\le 6$，对全排列枚举，取 $J(\pi)$ 最小的访问序（小规模精确最优）。
+  \item 若 $n>6$，采用\textbf{模拟退火}：初解在\textbf{基类最近邻序}与\textbf{按截止时间排序的全序列（EDD）}中取 $J$ 较小者；邻域包含\textbf{交换两位置}、\textbf{反转一段（2-opt 型）}、\textbf{单点移位（Or-opt-1）}；对交换移动辅以\textbf{短禁忌表}，长期无接受则\textbf{升温重启}降温轨迹。
+  \item 电量不可行时的\textbf{丢票重排}逻辑与基线相同：仍按最轻票剔除后重新优化访问序（调用同一套批次内优化子程序）。
+\end{itemize}
+
+\paragraph{对比实验脚本}
+\texttt{fleet\_metaheuristic.py} 中 \texttt{run\_controlled\_comparison()} 逐场景先跑基线 \texttt{FleetSimulator} 再跑子类，并校验任务流签名（产生时刻、目标节点、重量序列）一致，最后输出两套 \texttt{summarize} 得分差，便于报告中的控制变量说明。
 
 \subsection{充电与排队}
 \begin{itemize}
@@ -115,6 +138,6 @@ B_{\max}=500,\quad L_{\max}=250,\quad \rho=0.8,\quad v=1.0,\quad P_{\mathrm{char
 
 \section{小结}
 
-网格图 $+$ Dijkstra（行缓存）、离散时间动态任务、\textbf{仓库多票装车（重量贪心）与最近邻配送序、送完一批再回仓}、分段路径下的充电站槽位与区间预约，以及按时奖励、迟到/过期惩罚、按段路程惩罚构成总分 $S$。与代码不一致处以 \texttt{fleet\_simulation.py} 为准。
+网格图 $+$ Dijkstra（行缓存）、离散时间动态任务、\textbf{仓库多票装车（重量贪心）与最近邻配送序、送完一批再回仓}、分段路径下的充电站槽位与区间预约，以及按时奖励、迟到/过期惩罚、按段路程惩罚构成总分 $S$。上述基线行为以 \texttt{fleet\_simulation.py} 为准。\textbf{元启发式对比}在 \texttt{fleet\_metaheuristic.py} 中实现：装车为同重 EDD 平局；批内序为小规模全排列最优或模拟退火最小化 $J=\alpha_{d}D+\alpha_{\mathrm{late}}L$，与得分系数对齐以便改进访问序时兼顾路程与紧迫度。
 
 \end{document}
