@@ -13,9 +13,12 @@
 
 from __future__ import annotations
 
+import csv
 import heapq
 import math
+import os
 import random
+import sys
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
@@ -697,6 +700,73 @@ def preset_scenarios() -> List[SimConfig]:
     ]
 
 
+def node_to_grid_xy(node: int, cols: int) -> Tuple[int, int]:
+    """节点编号 → (行, 列)，与 build_grid_graph 行主序一致。"""
+    return node // cols, node % cols
+
+
+_TASK_CSV_FIELDNAMES = [
+    "scenario",
+    "seed",
+    "grid_rows",
+    "grid_cols",
+    "task_id",
+    "spawn_time",
+    "row",
+    "col",
+    "node_id",
+    "weight",
+    "deadline",
+]
+
+
+def write_scenario_tasks_csv(sim: FleetSimulator, filepath: str) -> None:
+    """将一次已运行结束的仿真中的全部任务写入单个 CSV。"""
+    cfg = sim.cfg
+    cols = cfg.cols
+    with open(filepath, "w", newline="", encoding="utf-8-sig") as f:
+        w = csv.DictWriter(f, fieldnames=_TASK_CSV_FIELDNAMES)
+        w.writeheader()
+        for tid in sorted(sim.tasks.keys()):
+            task = sim.tasks[tid]
+            r, c = node_to_grid_xy(task.node, cols)
+            w.writerow(
+                {
+                    "scenario": cfg.name,
+                    "seed": cfg.seed,
+                    "grid_rows": cfg.rows,
+                    "grid_cols": cfg.cols,
+                    "task_id": task.tid,
+                    "spawn_time": task.spawn_time,
+                    "row": r,
+                    "col": c,
+                    "node_id": task.node,
+                    "weight": task.weight,
+                    "deadline": task.deadline,
+                }
+            )
+
+
+def export_three_scenarios_tasks_csv(output_dir: str) -> List[str]:
+    """
+    仅导出三种规模：各跑一遍完整仿真，在 output_dir 下各写一个 CSV。
+    （与直接运行 main 不同，会重复仿真；一般改用默认 main 即可。）
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    written: List[str] = []
+    for cfg in preset_scenarios()[:3]:
+        sim = FleetSimulator(cfg)
+        sim.run()
+        safe_name = cfg.name.replace(os.sep, "_").replace("/", "_")
+        path = os.path.join(output_dir, f"{safe_name}_tasks.csv")
+        write_scenario_tasks_csv(sim, path)
+        written.append(path)
+    return written
+
+
+DEFAULT_TASK_EXPORT_DIR = "task_spawns_export"
+
+
 def summarize(sim: FleetSimulator) -> str:
     done = sum(1 for t in sim.tasks.values() if t.status == TaskStatus.DONE)
     expired = sum(1 for t in sim.tasks.values() if t.status == TaskStatus.EXPIRED)
@@ -714,12 +784,30 @@ def summarize(sim: FleetSimulator) -> str:
 
 
 def main() -> None:
-    for cfg in preset_scenarios():
+    os.makedirs(DEFAULT_TASK_EXPORT_DIR, exist_ok=True)
+    csv_written: List[str] = []
+    for idx, cfg in enumerate(preset_scenarios()):
         sim = FleetSimulator(cfg)
         sim.run()
         print(summarize(sim))
         print()
+        if idx < 3:
+            safe_name = cfg.name.replace(os.sep, "_").replace("/", "_")
+            path = os.path.join(DEFAULT_TASK_EXPORT_DIR, f"{safe_name}_tasks.csv")
+            write_scenario_tasks_csv(sim, path)
+            csv_written.append(os.path.abspath(path))
+    print("---")
+    print(f"已写入 SMALL / MEDIUM / LARGE 任务 CSV（共 {len(csv_written)} 个文件）:")
+    for p in csv_written:
+        print(f"  {p}")
 
 
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) > 1 and sys.argv[1] in ("--export-tasks", "-e"):
+        out_dir = sys.argv[2] if len(sys.argv) > 2 else "task_spawns_export"
+        paths = export_three_scenarios_tasks_csv(out_dir)
+        print(f"已写入目录: {out_dir}")
+        for p in paths:
+            print(f"  {p}")
+    else:
+        main()

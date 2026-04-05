@@ -1,2 +1,5 @@
 # JetBrains / PyCharm / IntelliJ
 .idea/
+
+# 任务导出 CSV（python fleet_simulation.py --export-tasks）
+task_spawns_export/
