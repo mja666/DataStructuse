@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
 """
-元启发式对比实验：在「相同配置、相同随机种子、相同任务生成流」下，
-基线仍为 fleet_simulation.FleetSimulator（最近邻 + 按重量装批）。
+元启发式对比实验：在「相同配置、相同随机种子、相同任务生成流」下做控制变量对比。
 
-本模块子类改进：
-1) 代价与评分对齐：路程项 × distance_penalty_coef + 迟到时间 × late_penalty_per_time；
-2) 多初解（最近邻 / EDD）、n≤6 精确枚举、SA + 交换 / 2-opt 段反序 / Or-opt 插入、轻量禁忌与降温重启；
-3) 装批：仍按重量贪心装满，与同重任务按截止 EDD 排序（不改变重量优先结构）。
+1) 重量装批基线：fleet_simulation.FleetSimulator（重量贪心装批 + 最近邻排程）；
+   元启发：MetaHeuristicFleetSimulator（同重 EDD 装批 + SA/精确访问序）。
+   运行: python fleet_metaheuristic.py
 
-运行: python fleet_metaheuristic.py
+2) 最近装批基线：fleet_nearest_first.FleetSimulatorNearestFirst（最近贪心装批 + 最近邻排程）；
+   元启发：MetaHeuristicNearestFleetSimulator（最近贪心装批 + SA/精确访问序）。
+   运行: python fleet_metaheuristic.py --nearest
+
+3) 两种对比都跑：python fleet_metaheuristic.py --all
+
+可视化（含最大任务 / 最近任务 / 两种元启发）：python fleet_metaheuristic.py --visual
 """
 
 from __future__ import annotations
@@ -18,7 +22,7 @@ import random
 import tkinter as tk
 from collections import deque
 from itertools import permutations
-from typing import Deque, List, Optional, Set, Tuple
+from typing import Callable, Deque, List, Optional, Set, Tuple
 
 from fleet_simulation import (
     FleetSimulator,
@@ -30,6 +34,8 @@ from fleet_simulation import (
     preset_scenarios,
     summarize,
 )
+from fleet_nearest_first import FleetSimulatorNearestFirst, pick_batch_greedy_nearest
+from fleet_rl_max_weight import RLMaxWeightFleetSimulator
 from fleet_visual import FleetVisualApp
 
 
@@ -258,6 +264,55 @@ class MetaHeuristicFleetSimulator(FleetSimulator):
                 delattr(self, "_route_opt_now")
 
 
+class MetaHeuristicNearestFleetSimulator(MetaHeuristicFleetSimulator):
+    """
+    与 MetaHeuristicFleetSimulator 相同的路由优化（SA/精确/代理代价），
+    装批改为 fleet_nearest_first.pick_batch_greedy_nearest（最近贪心装车）。
+    """
+
+    def _assign_vehicle(self, v: Vehicle, now: float) -> None:
+        if v.node != self.depot:
+            return
+        if v.carry_batch:
+            return
+        pending = [t for t in self.tasks.values() if t.status == TaskStatus.PENDING]
+        raw = pick_batch_greedy_nearest(
+            pending, now, self.cfg.load_capacity, self, self.depot, load_already=0.0
+        )
+        if not raw:
+            return
+
+        self._route_opt_now = now
+        try:
+            ordered = self._order_tasks_nn(self.depot, raw)
+            while len(ordered) > 1:
+                tour_d = self._tour_distance_with_return([t.node for t in ordered])
+                if self._energy_need(tour_d) <= v.battery + 1e-9:
+                    break
+                drop = min(ordered, key=lambda t: (t.weight, t.tid))
+                ordered.remove(drop)
+                ordered = self._order_tasks_nn(self.depot, ordered)
+            if not ordered:
+                return
+
+            tids = [t.tid for t in ordered]
+            for t in ordered:
+                t.status = TaskStatus.ASSIGNED
+                t.assigned_vehicle = v.vid
+
+            v.carry_batch = tids
+            v.batch_index = 0
+            v.current_task = tids[0]
+            v.load_used = sum(self.tasks[tid].weight for tid in tids)
+
+            first = self.tasks[tids[0]]
+            if not self._begin_leg_from_to(v, now, v.node, first.node, first.tid):
+                self._rollback_batch(v, tids)
+        finally:
+            if hasattr(self, "_route_opt_now"):
+                delattr(self, "_route_opt_now")
+
+
 def _task_stream_signature(sim: FleetSimulator) -> Tuple[int, Tuple[Tuple[float, int, float], ...]]:
     items = []
     for tid in sorted(sim.tasks.keys()):
@@ -273,7 +328,7 @@ def _obstacle_signature(sim: FleetSimulator) -> Tuple[int, Tuple[int, ...]]:
 
 def run_controlled_comparison() -> None:
     print("=" * 60)
-    print("控制变量对比：基线(重量装批+最近邻) vs 元启发式(同重EDD装批+SA/精确序)")
+    print("【重量装批】控制变量对比：基线(重量装批+最近邻) vs 元启发(同重EDD装批+SA/精确序)")
     print("相同项：SimConfig、随机种子、任务生成/截止/重量、仓库与充电站、车辆与充电模型")
     print("不同项：同重装批 EDD 平局规则 + 批次内 SA/精确访问序")
     print("=" * 60)
@@ -311,12 +366,62 @@ def run_controlled_comparison() -> None:
         print(f"  >>> 得分差 (元启发 - 基线): {ds:+.2f}")
 
 
+def run_controlled_comparison_nearest() -> None:
+    print("=" * 60)
+    print("【最近装批】控制变量对比：基线(最近贪心装批+最近邻) vs 元启发(最近装批+SA/精确序)")
+    print("相同项：SimConfig、随机种子、任务生成/截止/重量、仓库与充电站、车辆与充电模型")
+    print("不同项：批次内访问序由最近邻改为 SA/精确优化（装批集合均为最近贪心）")
+    print("=" * 60)
+
+    for cfg in preset_scenarios():
+        print(f"\n>>> 规模 [{cfg.name}]  seed={cfg.seed}")
+        base = FleetSimulatorNearestFirst(cfg)
+        base.run()
+        meta = MetaHeuristicNearestFleetSimulator(cfg)
+        meta.run()
+
+        sig_b = _task_stream_signature(base)
+        sig_m = _task_stream_signature(meta)
+        obs_b = _obstacle_signature(base)
+        obs_m = _obstacle_signature(meta)
+        if obs_b != obs_m:
+            print("  [警告] 障碍物布局不一致（不应发生），请检查随机数消费顺序。")
+            print(f"    基线: n={obs_b[0]}  元启发: n={obs_m[0]}")
+        else:
+            print(f"  [控制变量] 障碍物布局一致: 共 {obs_b[0]} 个障碍节点")
+        if sig_b != sig_m:
+            print("  [警告] 任务流签名不一致（不应发生），请检查随机数是否被元启发式污染。")
+            print(f"    基线: n={sig_b[0]}  元启发: n={sig_m[0]}")
+        else:
+            print(f"  [控制变量] 任务流一致: 共 {sig_b[0]} 条任务 (spawn_time, node, weight 序列相同)")
+
+        print("  --- 基线 (FleetSimulatorNearestFirst / 最近装批+最近邻) ---")
+        for line in summarize(base).split("\n"):
+            print("   ", line)
+        print("  --- 元启发式 (最近装批 + SA/精确序) ---")
+        for line in summarize(meta).split("\n"):
+            print("   ", line)
+
+        ds = meta.score - base.score
+        print(f"  >>> 得分差 (元启发 - 基线): {ds:+.2f}")
+
+
+def _default_visual_builders() -> dict[str, Callable[[SimConfig], FleetSimulator]]:
+    return {
+        "最大任务": FleetSimulator,
+        "最近任务": FleetSimulatorNearestFirst,
+        "强化学习·最大": RLMaxWeightFleetSimulator,
+        "元启发·重量": MetaHeuristicFleetSimulator,
+        "元启发·最近": MetaHeuristicNearestFleetSimulator,
+    }
+
+
 def run_meta_visual() -> None:
     root = tk.Tk()
     FleetVisualApp(
         root,
-        sim_builders={"元启发式": MetaHeuristicFleetSimulator},
-        default_builder="元启发式",
+        sim_builders=_default_visual_builders(),
+        default_builder="元启发·重量",
     )
     root.mainloop()
 
@@ -324,7 +429,14 @@ def run_meta_visual() -> None:
 if __name__ == "__main__":
     import sys
 
-    if len(sys.argv) > 1 and sys.argv[1] in ("--visual", "-v"):
+    args = sys.argv[1:]
+    if "--visual" in args or "-v" in args:
         run_meta_visual()
+    elif "--nearest" in args:
+        run_controlled_comparison_nearest()
+    elif "--all" in args:
+        run_controlled_comparison()
+        print("\n")
+        run_controlled_comparison_nearest()
     else:
         run_controlled_comparison()
