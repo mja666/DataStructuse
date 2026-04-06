@@ -1,4 +1,4 @@
-This is XeTeX, Version 3.141592653-2.6-0.999997 (TeX Live 2025) (preloaded format=xelatex 2025.8.28)  6 APR 2026 00:12
+This is XeTeX, Version 3.141592653-2.6-0.999997 (TeX Live 2025) (preloaded format=xelatex 2025.8.28)  6 APR 2026 11:26
 entering extended mode
  restricted \write18 enabled.
  %&-line parsing enabled.
@@ -618,11 +618,8 @@ Package hyperref Info: Link coloring ON on input line 12.
 \@outlinefile=\write3
 \openout3 = `simulation_methodology.out'.
 
-
-
-Package hyperref Warning: Rerun to get /PageLabels entry.
-
 LaTeX Font Info:    Trying to load font information for U+msa on input line 14.
+
 
 (d:/latex/texlive/2025/texmf-dist/tex/latex/amsfonts/umsa.fd
 File: umsa.fd 2013/01/14 v3.01 AMS symbols A
@@ -701,16 +698,21 @@ able
 [2]
 
 Package hyperref Warning: Token not allowed in a PDF string (Unicode):
-(hyperref)                removing `math shift' on input line 132.
+(hyperref)                removing `math shift' on input line 133.
 
 
 Package hyperref Warning: Token not allowed in a PDF string (Unicode):
-(hyperref)                removing `math shift' on input line 132.
+(hyperref)                removing `math shift' on input line 133.
 
 
 
 [3]
-Overfull \hbox (9.2068pt too wide) in paragraph at lines 141--142
+LaTeX Font Info:    Font shape `TU/lmtt/bx/n' in size <15.05624> not available
+(Font)              Font shape `TU/lmtt/b/n' tried instead on input line 140.
+
+
+[4]
+Overfull \hbox (9.2068pt too wide) in paragraph at lines 203--204
 \TU/SimSun(0)/m/n/10.53937 构 成 总 分 $\OML/cmm/m/it/10.53937 S$\TU/SimSun(0)/m/n/
 10.53937 。|  上 述 基 线 行 为 以 \TU/lmtt/m/n/10.53937 fleet_simulation.py \TU/SimSun
 (0)/m/n/10.53937 为 准。|  \TU/SimSun(0)/b/n/10.53937 元 启 发 式 对 比 \TU/SimSun(0)/m/
@@ -719,28 +721,24 @@ n/10.53937 在 \TU/lmtt/m/n/10.53937 fleet_metaheuristic.py
 
 
 
-[4] (./simulation_methodology.aux)
+[5]
+
+[6] (./simulation_methodology.aux)
  ***********
 LaTeX2e <2024-11-01> patch level 2
 L3 programming layer <2022/07/14>
  ***********
+Package rerunfilecheck Info: File `simulation_methodology.out' has not changed.
 
-
-Package rerunfilecheck Warning: File `simulation_methodology.out' has changed.
-(rerunfilecheck)                Rerun to get outlines right
-(rerunfilecheck)                or use package `bookmark'.
-
-Package rerunfilecheck Info: Checksums for `simulation_methodology.out':
-(rerunfilecheck)             Before: 61D21C244D817FD21416433A446959A9;1404
-(rerunfilecheck)             After:  AC4352792D3F008FC530D138916A3F0C;1830.
+(rerunfilecheck)             Checksum: A055EB02F51171DAD50ADEA37F3DA400;2916.
  ) 
 Here is how much of TeX's memory you used:
- 15971 strings out of 473832
- 358031 string characters out of 5730404
- 764540 words of memory out of 5000000
- 38796 multiletter control sequences out of 15000+600000
- 570196 words of font info for 116 fonts, out of 8000000 for 9000
+ 16145 strings out of 473832
+ 369264 string characters out of 5730404
+ 768290 words of memory out of 5000000
+ 38967 multiletter control sequences out of 15000+600000
+ 570212 words of font info for 118 fonts, out of 8000000 for 9000
  1348 hyphenation exceptions out of 8191
- 93i,11n,111p,412b,497s stack positions out of 10000i,1000n,20000p,200000b,200000s
+ 93i,13n,111p,559b,497s stack positions out of 10000i,1000n,20000p,200000b,200000s
 
-Output written on simulation_methodology.pdf (4 pages).
+Output written on simulation_methodology.pdf (6 pages).

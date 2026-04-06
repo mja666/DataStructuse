@@ -109,6 +109,7 @@ B_{\max}=500,\quad L_{\max}=250,\quad \rho=0.8,\quad v=1.0,\quad P_{\mathrm{char
 \textbf{XL\_STRESS} 为第四档场景名称：\textbf{XL} 表示网格规模最大（$100\times 100$）；\textbf{STRESS} 表示相对同规模地图\textbf{加压}——任务到达率 $p_{\mathrm{spawn}}$ 更高、截止裕量区间更紧、车辆与充电站数量相对偏少，用于观察调度在拥堵、易超时情形下的表现，与前三档“常规规模”形成对照。
 
 \section{最终得分的含义与计算公式}
+\label{sec:score}
 
 最终得分 $S$ 为\textbf{标量评价指标}，对应大作业中“完成越早、路径越短越高分，超时扣分”的定性要求。实现为\textbf{可加}形式。
 
@@ -136,8 +137,69 @@ B_{\max}=500,\quad L_{\max}=250,\quad \rho=0.8,\quad v=1.0,\quad P_{\mathrm{char
   \item 若修改 $\alpha_{\mathrm{early}},\alpha_{\mathrm{late}},\alpha_{d}$，数值尺度会变，比较时需对齐系数。
 \end{itemize}
 
-\section{小结}
+\section{静态 MILP（\texttt{fleet\_gurobi\_static.py}）与离散仿真（\texttt{fleet\_simulation.py}）的对照}
+\label{sec:gurobi-compare}
 
-网格图 $+$ Dijkstra（行缓存）、离散时间动态任务、\textbf{仓库多票装车（重量贪心）与最近邻配送序、送完一批再回仓}、分段路径下的充电站槽位与区间预约，以及按时奖励、迟到/过期惩罚、按段路程惩罚构成总分 $S$。上述基线行为以 \texttt{fleet\_simulation.py} 为准。\textbf{元启发式对比}在 \texttt{fleet\_metaheuristic.py} 中实现：装车为同重 EDD 平局；批内序为小规模全排列最优或模拟退火最小化 $J=\alpha_{d}D+\alpha_{\mathrm{late}}L$，与得分系数对齐以便改进访问序时兼顾路程与紧迫度。
+除\textbf{提前已知}全部任务的出现时刻、目标顶点、重量与截止时间（上帝视角）外，仍希望尽可能共用同一“世界”。本节说明\textbf{哪些条件与仿真一致}、\textbf{哪些必然不一致}，避免将 Gurobi 输出与 \texttt{run()} 轨迹做\textbf{逐事件等价}的误读。实现以 \texttt{gurobipy} 求解混合整数规划；具体变量与约束以代码为准。
+
+\subsection{数据与随机世界：可与仿真对齐的部分}
+
+\begin{itemize}
+  \item \textbf{场景参数}：与 \texttt{preset\_scenarios()} 中 \texttt{SimConfig} 一致（网格规模、车辆数、充电站数、$T_{\mathrm{sim}}$、$p_{\mathrm{spawn}}$、重量与截止裕量区间、$B_{\max},L_{\max},\rho,v,P_{\mathrm{charge}}$ 及得分系数等）。
+  \item \textbf{任务列表与充电站坐标}：代码中通过构造 \texttt{FleetSimulator(cfg)} 后\textbf{仅执行与 \texttt{run()} 相同的任务生成循环}（时间步长 $\Delta t=0.5$，每步以概率 $p_{\mathrm{spawn}}\cdot\Delta t$ 生成一单），\textbf{不执行}车辆派发与 \texttt{step()} 中其余逻辑。由此得到的任务序列与 \texttt{FleetSimulator.\_\_init\_\_} 中已确定的\textbf{仓库顶点}、各充电站\textbf{图节点编号}（\texttt{ChargingStation.node}）与完整仿真在“仅生成任务”意义下一致，从而保证\textbf{最短路距离矩阵}所依赖的端点与仿真相同。
+  \item \textbf{图与最短路}：与仿真一样在网格邻接图上用 Dijkstra 得到任意两点间最短路长度；行驶时间仍取 $d/v$。
+  \item \textbf{能耗与补电时长}：弧上耗电仍用 $\rho\cdot d$；在充电站将电池从到达电量充至 $B_{\max}$ 所需时间，与仿真中按功率 $P_{\mathrm{charge}}$ 由能量缺口换算的思路一致（代码中为线性约束 \texttt{dur}$\cdot P_{\mathrm{charge}}\ge B_{\max}-B_{\mathrm{arr}}$ 等）。
+  \item \textbf{载重}：静态模型中每辆车\textbf{单趟路径}上所承载任务重量之和 $\le L_{\max}$，对应仿真里“在仓库一次装齐本批再出发、本批总重不超过载重上限”的设定。
+  \item \textbf{并发槽位数}：每个物理充电站在任意时刻“同时在充”的车辆数上限为 $2$，与仿真里 \texttt{slots}=2 的\textbf{数量}一致（实现机制不同，见下节）。
+\end{itemize}
+
+\subsection{模型结构：与仿真不一致或仅为近似的部分}
+
+以下差异来自\textbf{静态优化}与\textbf{离散事件仿真}的不同范式，一般不能仅靠调参消除。
+
+\paragraph{（1）动态多趟 vs.\ 静态单趟}
+仿真中车辆在仿真期内可多次回仓、再装新批、再出发，形成\textbf{多条}“出仓—送批—回仓”轨迹；当前 MILP 为\textbf{每辆车一条}从起点仓到终点仓的闭合路径抽象（含可选充电节点），相当于对\textbf{一整段连续作业}做一次性规划，\textbf{不重现}“回仓后再派下一批”的多轮决策过程。因此即便任务全集相同，\textbf{时间轴上的决策次数与仿真也不相同}。
+
+\paragraph{（2）充电排队：连续时间预约 vs.\ 离散时间槽容量}
+仿真中充电通过时间区间 $[t_{\mathrm{start}},t_{\mathrm{end}})$ 预约，在槽位占满时按\textbf{最早可开始时刻}推进，是会话列表驱动的\textbf{连续时间}排队。
+MILP 中将时间轴按步长 $\Delta_q$（代码参数 \texttt{queue-delta}）分段，用二进制变量刻画充电区间与每个时间槽是否相交，并对每个物理站、每个槽施加\textbf{同时在槽内占用数 $\le 2$}。这是对“两槽并行”的\textbf{离散近似}：\textbf{不能保证}与仿真中每一次 \texttt{\_reserve\_charge}、\texttt{\_next\_charge\_start} 得到的开始/结束时刻逐次相同；$\Delta_q$ 越小通常越细、变量越多，仍未必与连续预约\textbf{事件级等价}。
+
+\paragraph{（3）路径段与失败回退}
+仿真中 \texttt{\_begin\_leg\_from\_to} 在电量、充电站可达性等条件下可能失败并触发\textbf{批次回滚}等逻辑；MILP 通常假设所选弧在能量与时间上可行，\textbf{不包含}与仿真完全同构的回滚分支。
+
+\paragraph{（4）目标函数与仿真得分 $S$}
+仿真得分 $S$ 按第~\ref{sec:score}~节在任务完成、过期等\textbf{离散事件}上累加；MILP 目标为\textbf{线性代理}（如服务任务的重量的按时奖励系数之和、减去迟到项、距离惩罚及未服务惩罚等），用于在静态假设下求较优路径，\textbf{数值上不等于}同一次仿真运行结束后的 $S$，也不宜在无控制实验设计下直接宣称“同分”。
+
+\paragraph{（5）任务子集与规模}
+为控制整数规划规模，实现中常只对按重量排序后的\textbf{前若干条}任务建变量（参数 \texttt{max-tasks}）；仿真则对\textbf{全部}到达任务执行在线规则。对比报告时需说明 MILP 求解的是\textbf{子问题}还是经筛选后的实例。
+
+\subsection{对照小结表（便于报告引用）}
+
+\begin{table}[htbp]
+  \centering
+  \caption{静态 MILP 与 \texttt{fleet\_simulation.py} 主要对照（除上帝视角外）}
+  \small
+  \begin{tabular}{@{}p{0.28\textwidth}p{0.32\textwidth}p{0.32\textwidth}@{}}
+    \toprule
+    项目 & 仿真（动态） & 静态 MILP（Gurobi） \\
+    \midrule
+    任务与充电站几何 & \multicolumn{2}{@{}p{0.64\textwidth}@{}}{可与 \texttt{FleetSimulator} 仅生成任务时对齐（同 \texttt{seed}、同配置）。} \\
+    最短路、$v$、$\rho$、$B_{\max}$、$L_{\max}$、$P_{\mathrm{charge}}$ & \multicolumn{2}{@{}p{0.64\textwidth}@{}}{定义一致，用于距离、时间与能耗。} \\
+    决策时刻 & 每步 \texttt{step} 在线派车、装批、路径段 & 一次性离线优化（已知全集）。 \\
+    车辆路径条数 & 多趟回仓、多批任务 & 当前实现为每车单条闭合路径（单趟抽象）。 \\
+    充电排队 & 连续区间 $+$ 槽位预约 $+$ 推进最早开始时刻 & 时间槽上的容量约束（$\le 2$），离散近似。 \\
+    得分 & 事件累加 $S$（第~\ref{sec:score}~节） & 代理目标，与 $S$ 不完全同一函数。 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\subsection{如何撰写对比结论}
+
+建议在报告中分三点写清边界：\textbf{（i）}数据层（任务、仓库、充电站节点、路网与参数）与仿真可对齐；\textbf{（ii）}优化层为静态、单趟抽象 $+$ 离散排队近似，与 \texttt{run()} 的\textbf{多轮动态过程}及\textbf{连续充电预约}不完全同构；\textbf{（iii）}数值对比应以“同实例下的上界/参考解/策略差异说明”为主，避免将 MILP 目标值与仿真 $S$ 直接等同为同一标尺。
+
+\section{小结}
+\label{sec:summary}
+
+网格图 $+$ Dijkstra（行缓存）、离散时间动态任务、\textbf{仓库多票装车（重量贪心）与最近邻配送序、送完一批再回仓}、分段路径下的充电站槽位与区间预约，以及按时奖励、迟到/过期惩罚、按段路程惩罚构成总分 $S$。上述基线行为以 \texttt{fleet\_simulation.py} 为准。\textbf{元启发式对比}在 \texttt{fleet\_metaheuristic.py} 中实现：装车为同重 EDD 平局；批内序为小规模全排列最优或模拟退火最小化 $J=\alpha_{d}D+\alpha_{\mathrm{late}}L$，与得分系数对齐以便改进访问序时兼顾路程与紧迫度。\textbf{静态 MILP} 在 \texttt{fleet\_gurobi\_static.py} 中实现：与仿真可对齐任务与充电站布局及主要物理参数，但在多趟动态过程、充电排队机制与目标函数上与仿真\textbf{不等价}，详见第~\ref{sec:gurobi-compare}~节。
 
 \end{document}

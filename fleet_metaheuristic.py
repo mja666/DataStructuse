@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import math
 import random
+import tkinter as tk
 from collections import deque
 from itertools import permutations
 from typing import Deque, List, Optional, Set, Tuple
@@ -29,6 +30,7 @@ from fleet_simulation import (
     preset_scenarios,
     summarize,
 )
+from fleet_visual import FleetVisualApp
 
 
 def pick_batch_weight_then_edd(
@@ -264,6 +266,11 @@ def _task_stream_signature(sim: FleetSimulator) -> Tuple[int, Tuple[Tuple[float,
     return (len(items), tuple(items))
 
 
+def _obstacle_signature(sim: FleetSimulator) -> Tuple[int, Tuple[int, ...]]:
+    obs = tuple(sorted(getattr(sim, "obstacles", set())))
+    return (len(obs), obs)
+
+
 def run_controlled_comparison() -> None:
     print("=" * 60)
     print("控制变量对比：基线(重量装批+最近邻) vs 元启发式(同重EDD装批+SA/精确序)")
@@ -280,6 +287,13 @@ def run_controlled_comparison() -> None:
 
         sig_b = _task_stream_signature(base)
         sig_m = _task_stream_signature(meta)
+        obs_b = _obstacle_signature(base)
+        obs_m = _obstacle_signature(meta)
+        if obs_b != obs_m:
+            print("  [警告] 障碍物布局不一致（不应发生），请检查随机数消费顺序。")
+            print(f"    基线: n={obs_b[0]}  元启发: n={obs_m[0]}")
+        else:
+            print(f"  [控制变量] 障碍物布局一致: 共 {obs_b[0]} 个障碍节点")
         if sig_b != sig_m:
             print("  [警告] 任务流签名不一致（不应发生），请检查随机数是否被元启发式污染。")
             print(f"    基线: n={sig_b[0]}  元启发: n={sig_m[0]}")
@@ -297,5 +311,20 @@ def run_controlled_comparison() -> None:
         print(f"  >>> 得分差 (元启发 - 基线): {ds:+.2f}")
 
 
+def run_meta_visual() -> None:
+    root = tk.Tk()
+    FleetVisualApp(
+        root,
+        sim_builders={"元启发式": MetaHeuristicFleetSimulator},
+        default_builder="元启发式",
+    )
+    root.mainloop()
+
+
 if __name__ == "__main__":
-    run_controlled_comparison()
+    import sys
+
+    if len(sys.argv) > 1 and sys.argv[1] in ("--visual", "-v"):
+        run_meta_visual()
+    else:
+        run_controlled_comparison()

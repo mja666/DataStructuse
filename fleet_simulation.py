@@ -21,7 +21,7 @@ import random
 import sys
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 
 # ---------------------------- 图与最短路 ----------------------------
@@ -60,20 +60,29 @@ def path_from_parent(parent: List[int], src: int, dst: int) -> List[int]:
     return path
 
 
-def build_grid_graph(rows: int, cols: int) -> Tuple[int, List[List[Tuple[int, float]]]]:
-    """行主序编号，四邻接，边权为欧氏距离。"""
+def build_grid_graph(
+    rows: int,
+    cols: int,
+    blocked_nodes: Optional[Set[int]] = None,
+) -> Tuple[int, List[List[Tuple[int, float]]]]:
+    """行主序编号，四邻接，边权为欧氏距离；障碍节点无边。"""
     n = rows * cols
     adj: List[List[Tuple[int, float]]] = [[] for _ in range(n)]
+    blocked = blocked_nodes or set()
 
     def coord(k: int) -> Tuple[int, int]:
         return k // cols, k % cols
 
     for u in range(n):
+        if u in blocked:
+            continue
         r, c = coord(u)
         for dr, dc in ((1, 0), (-1, 0), (0, 1), (0, -1)):
             nr, nc = r + dr, c + dc
             if 0 <= nr < rows and 0 <= nc < cols:
                 v = nr * cols + nc
+                if v in blocked:
+                    continue
                 w = math.hypot(dr, dc)
                 adj[u].append((v, w))
     return n, adj
@@ -153,6 +162,7 @@ class SimConfig:
     early_bonus_per_weight: float
     late_penalty_per_time: float
     distance_penalty_coef: float
+    obstacle_cover_ratio: float = 0.15
     seed: int = 42
 
 
@@ -241,8 +251,11 @@ class FleetSimulator:
         self.cfg = cfg
         random.seed(cfg.seed)
         self._rng = random.Random(cfg.seed)
-        self.n, self.adj = build_grid_graph(cfg.rows, cfg.cols)
         self.depot = self._random_depot_in_center(cfg.rows, cfg.cols, self._rng)
+        self.obstacles = self._generate_obstacles()
+        self.n, self.adj = build_grid_graph(cfg.rows, cfg.cols, self.obstacles)
+        self._non_obstacle_nodes = [i for i in range(self.n) if i not in self.obstacles]
+        self._task_candidate_nodes = [i for i in self._non_obstacle_nodes if i != self.depot]
         self._dist_row_cache: Dict[int, Tuple[List[float], List[int]]] = {}
 
         self.tasks: Dict[int, Task] = {}
@@ -262,6 +275,41 @@ class FleetSimulator:
         self.chargers = self._place_chargers(cfg.num_chargers)
         self.score = 0.0
 
+    def _generate_obstacles(self) -> Set[int]:
+        """
+        随机矩形障碍：2x2 / 2x3 / 1x4（含旋转）；仓库格必定不在障碍中。
+        """
+        rows, cols = self.cfg.rows, self.cfg.cols
+        n = rows * cols
+        target = int(n * max(0.0, min(0.35, self.cfg.obstacle_cover_ratio)))
+        if target <= 0:
+            return set()
+
+        obstacles: Set[int] = set()
+        shapes = [(2, 2), (2, 3), (3, 2), (1, 4), (4, 1)]
+        protect = {self.depot}
+        attempts = 0
+        max_attempts = max(200, n * 6)
+
+        while len(obstacles) < target and attempts < max_attempts:
+            attempts += 1
+            h, w = self._rng.choice(shapes)
+            if h > rows or w > cols:
+                continue
+            r0 = self._rng.randint(0, rows - h)
+            c0 = self._rng.randint(0, cols - w)
+
+            block = set()
+            for rr in range(r0, r0 + h):
+                for cc in range(c0, c0 + w):
+                    block.add(rr * cols + cc)
+
+            if block & protect:
+                continue
+            obstacles |= block
+
+        return obstacles
+
     def _ensure_dijkstra(self, src: int) -> Tuple[List[float], List[int]]:
         if src not in self._dist_row_cache:
             self._dist_row_cache[src] = dijkstra(self.n, self.adj, src)
@@ -273,7 +321,7 @@ class FleetSimulator:
 
     def _place_chargers(self, k: int) -> List[ChargingStation]:
         """在图中均匀撒点充电站（避开仓库节点）。"""
-        nodes = [i for i in range(self.n) if i != self.depot]
+        nodes = [i for i in self._non_obstacle_nodes if i != self.depot]
         self._rng.shuffle(nodes)
         chosen = nodes[:k] if k <= len(nodes) else nodes
         return [
@@ -284,7 +332,9 @@ class FleetSimulator:
     def _spawn_task(self, t: float) -> None:
         slack_lo, slack_hi = self.cfg.deadline_slack_range
         w_lo, w_hi = self.cfg.weight_range
-        node = self._rng.randrange(self.n)
+        if not self._task_candidate_nodes:
+            return
+        node = self._rng.choice(self._task_candidate_nodes)
         weight = self._rng.uniform(w_lo, w_hi)
         deadline = t + self._rng.uniform(slack_lo, slack_hi)
         task = Task(
@@ -403,20 +453,11 @@ class FleetSimulator:
                 self.tasks[record_tid].travel_distance = d_direct
             return True
 
-        cnode = nearest_charger_node(self.chargers, self, from_node)
-        if cnode is None:
+        best = self._best_charger_plan(from_node, to_node, now, v.battery)
+        if best is None:
             return False
-        d1 = self.dist_uv(from_node, cnode)
-        d2 = self.dist_uv(cnode, to_node)
-        if math.isinf(d1) or math.isinf(d2):
-            return False
+        station, cnode, d1, d2 = best
         e1 = self._energy_need(d1)
-        if e1 > v.battery + 1e-9:
-            return False
-
-        station = self._station_on_node(cnode)
-        if station is None:
-            return False
 
         t_arrive_c = now + self._travel_time(d1)
         bat_after_leg1 = v.battery - e1
@@ -443,6 +484,49 @@ class FleetSimulator:
         if record_tid is not None:
             self.tasks[record_tid].travel_distance = d1 + d2
         return True
+
+    def _best_charger_plan(
+        self,
+        from_node: int,
+        to_node: int,
+        now: float,
+        battery_now: float,
+    ) -> Optional[Tuple[ChargingStation, int, float, float]]:
+        """
+        选择使“到达目的地时刻”最小的充电站，代价包含：
+        行驶到站 + 排队等待 + 充电时间 + 充后行驶到目标。
+        """
+        best: Optional[Tuple[ChargingStation, int, float, float]] = None
+        best_arrival = math.inf
+
+        for cs in self.chargers:
+            cnode = cs.node
+            d1 = self.dist_uv(from_node, cnode)
+            d2 = self.dist_uv(cnode, to_node)
+            if math.isinf(d1) or math.isinf(d2):
+                continue
+
+            e1 = self._energy_need(d1)
+            if e1 > battery_now + 1e-9:
+                continue
+
+            t_arrive_c = now + self._travel_time(d1)
+            battery_after_leg1 = battery_now - e1
+            missing = max(0.0, self.cfg.battery_capacity - battery_after_leg1)
+            charge_duration = missing / self.cfg.charge_power
+            charge_start = self._next_charge_start(cs, t_arrive_c)
+            charge_end = charge_start + charge_duration
+
+            e2 = self._energy_need(d2)
+            if e2 > self.cfg.battery_capacity + 1e-9:
+                continue
+
+            arrival = charge_end + self._travel_time(d2)
+            if arrival < best_arrival:
+                best_arrival = arrival
+                best = (cs, cnode, d1, d2)
+
+        return best
 
     def _rollback_batch(self, v: Vehicle, tids: List[int]) -> None:
         for tid in tids:
@@ -545,19 +629,11 @@ class FleetSimulator:
             v.busy_until = now + tr
             return
 
-        cnode = nearest_charger_node(self.chargers, self, v.node)
-        if cnode is None:
+        best = self._best_charger_plan(v.node, self.depot, now, v.battery)
+        if best is None:
             return
-        d1 = self.dist_uv(v.node, cnode)
-        d2 = self.dist_uv(cnode, self.depot)
-        if math.isinf(d1) or math.isinf(d2):
-            return
+        station, cnode, d1, d2 = best
         e1 = self._energy_need(d1)
-        if e1 > v.battery + 1e-9:
-            return
-        station = self._station_on_node(cnode)
-        if station is None:
-            return
         t_arrive_c = now + self._travel_time(d1)
         bat1 = v.battery - e1
         _, charge_end = self._reserve_charge(station, v.vid, t_arrive_c, bat1)
@@ -655,6 +731,7 @@ def preset_scenarios() -> List[SimConfig]:
             task_spawn_rate=0.40,
             weight_range=(5.0, 40.0),
             deadline_slack_range=(125.0, 275.0),
+            obstacle_cover_ratio=0.14,
             **base,
             seed=1,
         ),
@@ -668,6 +745,7 @@ def preset_scenarios() -> List[SimConfig]:
             task_spawn_rate=0.60,
             weight_range=(5.0, 75.0),
             deadline_slack_range=(100.0, 300.0),
+            obstacle_cover_ratio=0.16,
             **base,
             seed=2,
         ),
@@ -681,6 +759,7 @@ def preset_scenarios() -> List[SimConfig]:
             task_spawn_rate=0.75,
             weight_range=(10.0, 125.0),
             deadline_slack_range=(90.0, 250.0),
+            obstacle_cover_ratio=0.18,
             **base,
             seed=3,
         ),
@@ -694,6 +773,7 @@ def preset_scenarios() -> List[SimConfig]:
             task_spawn_rate=1.10,
             weight_range=(15.0, 150.0),
             deadline_slack_range=(60.0, 175.0),
+            obstacle_cover_ratio=0.20,
             **base,
             seed=4,
         ),
@@ -718,6 +798,85 @@ _TASK_CSV_FIELDNAMES = [
     "weight",
     "deadline",
 ]
+
+_META_CSV_FIELDNAMES = [
+    "scenario",
+    "seed",
+    "grid_rows",
+    "grid_cols",
+    "num_vehicles",
+    "num_chargers",
+    "depot_row",
+    "depot_col",
+    "depot_node_id",
+    "obstacle_count",
+]
+
+_OBSTACLE_CSV_FIELDNAMES = [
+    "scenario",
+    "seed",
+    "grid_rows",
+    "grid_cols",
+    "obstacle_id",
+    "row",
+    "col",
+    "node_id",
+]
+
+
+def write_export_readme_txt(output_dir: str) -> str:
+    """
+    在导出目录写入 README.txt，说明各 CSV 文件及列含义。
+    返回写入文件的绝对路径。
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    path = os.path.join(output_dir, "README.txt")
+    content = """CSV 导出说明
+================
+
+目录中的文件按场景命名（例如 SMALL / MEDIUM / LARGE），每个场景包含三类 CSV：
+
+1) <SCENARIO>_tasks.csv
+   任务级明细，一行一个任务。
+   - scenario: 场景名称
+   - seed: 随机种子
+   - grid_rows: 网格行数
+   - grid_cols: 网格列数
+   - task_id: 任务编号
+   - spawn_time: 任务生成时间
+   - row: 任务位置行坐标
+   - col: 任务位置列坐标
+   - node_id: 任务节点 id（行主序：row * grid_cols + col）
+   - weight: 任务重量
+   - deadline: 任务截止时间
+
+2) <SCENARIO>_meta.csv
+   场景级元信息，一般仅一行。
+   - scenario: 场景名称
+   - seed: 随机种子
+   - grid_rows: 网格行数
+   - grid_cols: 网格列数
+   - num_vehicles: 车辆数量
+   - num_chargers: 充电站数量
+   - depot_row: 仓库位置行坐标
+   - depot_col: 仓库位置列坐标
+   - depot_node_id: 仓库节点 id（行主序）
+   - obstacle_count: 障碍节点总数
+
+3) <SCENARIO>_obstacles.csv
+   障碍物位置明细，一行一个障碍节点。
+   - scenario: 场景名称
+   - seed: 随机种子
+   - grid_rows: 网格行数
+   - grid_cols: 网格列数
+   - obstacle_id: 障碍顺序编号（按 node_id 升序后从 0 开始）
+   - row: 障碍位置行坐标
+   - col: 障碍位置列坐标
+   - node_id: 障碍节点 id（行主序）
+"""
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(content)
+    return os.path.abspath(path)
 
 
 def write_scenario_tasks_csv(sim: FleetSimulator, filepath: str) -> None:
@@ -747,6 +906,51 @@ def write_scenario_tasks_csv(sim: FleetSimulator, filepath: str) -> None:
             )
 
 
+def write_scenario_meta_csv(sim: FleetSimulator, filepath: str) -> None:
+    """导出场景级元信息：仓库位置、车辆数量、障碍数量等。"""
+    cfg = sim.cfg
+    depot_r, depot_c = node_to_grid_xy(sim.depot, cfg.cols)
+    with open(filepath, "w", newline="", encoding="utf-8-sig") as f:
+        w = csv.DictWriter(f, fieldnames=_META_CSV_FIELDNAMES)
+        w.writeheader()
+        w.writerow(
+            {
+                "scenario": cfg.name,
+                "seed": cfg.seed,
+                "grid_rows": cfg.rows,
+                "grid_cols": cfg.cols,
+                "num_vehicles": cfg.num_vehicles,
+                "num_chargers": cfg.num_chargers,
+                "depot_row": depot_r,
+                "depot_col": depot_c,
+                "depot_node_id": sim.depot,
+                "obstacle_count": len(sim.obstacles),
+            }
+        )
+
+
+def write_scenario_obstacles_csv(sim: FleetSimulator, filepath: str) -> None:
+    """导出障碍物位置明细（行/列/节点 id）。"""
+    cfg = sim.cfg
+    with open(filepath, "w", newline="", encoding="utf-8-sig") as f:
+        w = csv.DictWriter(f, fieldnames=_OBSTACLE_CSV_FIELDNAMES)
+        w.writeheader()
+        for oid, node in enumerate(sorted(sim.obstacles)):
+            r, c = node_to_grid_xy(node, cfg.cols)
+            w.writerow(
+                {
+                    "scenario": cfg.name,
+                    "seed": cfg.seed,
+                    "grid_rows": cfg.rows,
+                    "grid_cols": cfg.cols,
+                    "obstacle_id": oid,
+                    "row": r,
+                    "col": c,
+                    "node_id": node,
+                }
+            )
+
+
 def export_three_scenarios_tasks_csv(output_dir: str) -> List[str]:
     """
     仅导出三种规模：各跑一遍完整仿真，在 output_dir 下各写一个 CSV。
@@ -754,13 +958,19 @@ def export_three_scenarios_tasks_csv(output_dir: str) -> List[str]:
     """
     os.makedirs(output_dir, exist_ok=True)
     written: List[str] = []
+    readme_path = write_export_readme_txt(output_dir)
+    written.append(readme_path)
     for cfg in preset_scenarios()[:3]:
         sim = FleetSimulator(cfg)
         sim.run()
         safe_name = cfg.name.replace(os.sep, "_").replace("/", "_")
-        path = os.path.join(output_dir, f"{safe_name}_tasks.csv")
-        write_scenario_tasks_csv(sim, path)
-        written.append(path)
+        path_tasks = os.path.join(output_dir, f"{safe_name}_tasks.csv")
+        path_meta = os.path.join(output_dir, f"{safe_name}_meta.csv")
+        path_obstacles = os.path.join(output_dir, f"{safe_name}_obstacles.csv")
+        write_scenario_tasks_csv(sim, path_tasks)
+        write_scenario_meta_csv(sim, path_meta)
+        write_scenario_obstacles_csv(sim, path_obstacles)
+        written.extend([path_tasks, path_meta, path_obstacles])
     return written
 
 
@@ -786,6 +996,8 @@ def summarize(sim: FleetSimulator) -> str:
 def main() -> None:
     os.makedirs(DEFAULT_TASK_EXPORT_DIR, exist_ok=True)
     csv_written: List[str] = []
+    readme_path = write_export_readme_txt(DEFAULT_TASK_EXPORT_DIR)
+    csv_written.append(readme_path)
     for idx, cfg in enumerate(preset_scenarios()):
         sim = FleetSimulator(cfg)
         sim.run()
@@ -793,11 +1005,23 @@ def main() -> None:
         print()
         if idx < 3:
             safe_name = cfg.name.replace(os.sep, "_").replace("/", "_")
-            path = os.path.join(DEFAULT_TASK_EXPORT_DIR, f"{safe_name}_tasks.csv")
-            write_scenario_tasks_csv(sim, path)
-            csv_written.append(os.path.abspath(path))
+            path_tasks = os.path.join(DEFAULT_TASK_EXPORT_DIR, f"{safe_name}_tasks.csv")
+            path_meta = os.path.join(DEFAULT_TASK_EXPORT_DIR, f"{safe_name}_meta.csv")
+            path_obstacles = os.path.join(
+                DEFAULT_TASK_EXPORT_DIR, f"{safe_name}_obstacles.csv"
+            )
+            write_scenario_tasks_csv(sim, path_tasks)
+            write_scenario_meta_csv(sim, path_meta)
+            write_scenario_obstacles_csv(sim, path_obstacles)
+            csv_written.extend(
+                [
+                    os.path.abspath(path_tasks),
+                    os.path.abspath(path_meta),
+                    os.path.abspath(path_obstacles),
+                ]
+            )
     print("---")
-    print(f"已写入 SMALL / MEDIUM / LARGE 任务 CSV（共 {len(csv_written)} 个文件）:")
+    print(f"已写入 SMALL / MEDIUM / LARGE 场景 CSV（共 {len(csv_written)} 个文件）:")
     for p in csv_written:
         print(f"  {p}")
 

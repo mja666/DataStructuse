@@ -7,6 +7,7 @@ import math
 import tkinter as tk
 from collections import defaultdict, deque
 from tkinter import ttk
+from typing import Callable
 
 from fleet_simulation import FleetSimulator, SimConfig, TaskStatus, preset_scenarios
 
@@ -74,12 +75,33 @@ def _flatten_route_points(segments: list[tuple[float, float, list[int]]], cxy) -
 
 
 class FleetVisualApp:
-    def __init__(self, root: tk.Tk) -> None:
+    def __init__(
+        self,
+        root: tk.Tk,
+        sim_builders: dict[str, Callable[[SimConfig], FleetSimulator]] | None = None,
+        default_builder: str | None = None,
+    ) -> None:
         self.root = root
         self.root.title("Fleet")
         self.scenarios = preset_scenarios()
         self.sim: FleetSimulator | None = None
         self.cfg: SimConfig | None = None
+        if sim_builders is None:
+            self.sim_builders = {"基线": FleetSimulator}
+            try:
+                from fleet_metaheuristic import MetaHeuristicFleetSimulator
+
+                self.sim_builders["元启发式"] = MetaHeuristicFleetSimulator
+            except Exception:
+                pass
+        else:
+            self.sim_builders = sim_builders
+        self._builder_names = list(self.sim_builders.keys())
+        self._current_builder_name = (
+            default_builder
+            if default_builder in self.sim_builders
+            else self._builder_names[0]
+        )
         self.t = 0.0
         self.dt = 0.5
         self.running = False
@@ -90,6 +112,7 @@ class FleetVisualApp:
             "bg": "#16161e",
             "grid": "#292e42",
             "cell": "#1f2233",
+            "obstacle": "#3b2f2f",
             "depot": "#e0af68",
             "charger": "#73daca",
             "task_pend": "#ff8a4c",
@@ -125,6 +148,16 @@ class FleetVisualApp:
         self.combo.pack(side=tk.LEFT, padx=4)
         self.combo.bind("<<ComboboxSelected>>", self._on_scenario)
 
+        self.sim_combo = ttk.Combobox(
+            top,
+            state="readonly",
+            width=10,
+            values=self._builder_names,
+        )
+        self.sim_combo.current(self._builder_names.index(self._current_builder_name))
+        self.sim_combo.pack(side=tk.LEFT, padx=4)
+        self.sim_combo.bind("<<ComboboxSelected>>", self._on_sim_type)
+
         ttk.Button(top, text="▶", width=3, command=self._play).pack(side=tk.LEFT, padx=2)
         ttk.Button(top, text="⏸", width=3, command=self._pause).pack(side=tk.LEFT, padx=2)
         ttk.Button(top, text="↻", width=3, command=self._restart).pack(side=tk.LEFT, padx=2)
@@ -144,6 +177,12 @@ class FleetVisualApp:
     def _on_scenario(self, _evt=None) -> None:
         self._restart()
 
+    def _on_sim_type(self, _evt=None) -> None:
+        name = self.sim_combo.get().strip()
+        if name in self.sim_builders:
+            self._current_builder_name = name
+        self._restart()
+
     def _play(self) -> None:
         self.running = True
 
@@ -156,7 +195,9 @@ class FleetVisualApp:
         if idx < 0:
             idx = 0
         self.cfg = self.scenarios[idx]
-        self.sim = FleetSimulator(self.cfg)
+        builder = self.sim_builders[self._current_builder_name]
+        self.sim = builder(self.cfg)
+        self.root.title(f"Fleet - {self._current_builder_name}")
         self.t = 0.0
         self._trails = {}
 
@@ -218,6 +259,7 @@ class FleetVisualApp:
             return x, y
 
         charger_nodes = {csn.node for csn in sim.chargers}
+        obstacle_nodes = sim.obstacles if hasattr(sim, "obstacles") else set()
 
         for r in range(rows + 1):
             y = oy + r * cs
@@ -232,7 +274,9 @@ class FleetVisualApp:
             x1 = x0 + cs - 2
             y1 = y0 + cs - 2
             fill = self._colors["cell"]
-            if node == sim.depot:
+            if node in obstacle_nodes:
+                fill = self._colors["obstacle"]
+            elif node == sim.depot:
                 fill = self._colors["depot"]
             elif node in charger_nodes:
                 fill = "#1a3d36"
@@ -425,6 +469,19 @@ class FleetVisualApp:
             )
 
         leg_item(xi, d_chg, "充电站")
+        xi += 100
+
+        def d_obs(x: float, cy: float) -> None:
+            self.canvas.create_rectangle(
+                x + 1,
+                cy - 7,
+                x + 15,
+                cy + 7,
+                fill=self._colors["obstacle"],
+                outline="#1a1b26",
+            )
+
+        leg_item(xi, d_obs, "障碍物")
         xi += 100
 
         def d_pend(x: float, cy: float) -> None:
