@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""图形界面：沿最短路插值移动、规划虚线、轨迹尾迹、图例。运行: python fleet_visual.py"""
+"""图形界面：沿最短路插值移动、规划虚线、轨迹尾迹、图例。运行: python fleet_visual.py
+
+顶栏「策略」下拉可选：最大任务 / 最近任务（若依赖可用则还有元启发·重量、元启发·最近）。
+"""
 
 from __future__ import annotations
 
@@ -10,6 +13,8 @@ from tkinter import ttk
 from typing import Callable
 
 from fleet_simulation import FleetSimulator, SimConfig, TaskStatus, preset_scenarios
+
+SimBuilder = Callable[[SimConfig], FleetSimulator]
 
 
 def _interp_on_path(
@@ -78,7 +83,7 @@ class FleetVisualApp:
     def __init__(
         self,
         root: tk.Tk,
-        sim_builders: dict[str, Callable[[SimConfig], FleetSimulator]] | None = None,
+        sim_builders: dict[str, SimBuilder] | None = None,
         default_builder: str | None = None,
     ) -> None:
         self.root = root
@@ -87,13 +92,30 @@ class FleetVisualApp:
         self.sim: FleetSimulator | None = None
         self.cfg: SimConfig | None = None
         if sim_builders is None:
-            self.sim_builders = {"基线": FleetSimulator}
+            builders: dict[str, SimBuilder] = {"最大任务": FleetSimulator}
             try:
-                from fleet_metaheuristic import MetaHeuristicFleetSimulator
+                from fleet_nearest_first import FleetSimulatorNearestFirst
 
-                self.sim_builders["元启发式"] = MetaHeuristicFleetSimulator
+                builders["最近任务"] = FleetSimulatorNearestFirst
             except Exception:
                 pass
+            try:
+                from fleet_metaheuristic import (
+                    MetaHeuristicFleetSimulator,
+                    MetaHeuristicNearestFleetSimulator,
+                )
+
+                builders["元启发·重量"] = MetaHeuristicFleetSimulator
+                builders["元启发·最近"] = MetaHeuristicNearestFleetSimulator
+            except Exception:
+                pass
+            try:
+                from fleet_rl_max_weight import RLMaxWeightFleetSimulator
+
+                builders["强化学习·最大"] = RLMaxWeightFleetSimulator
+            except Exception:
+                pass
+            self.sim_builders = builders
         else:
             self.sim_builders = sim_builders
         self._builder_names = list(self.sim_builders.keys())
@@ -148,10 +170,11 @@ class FleetVisualApp:
         self.combo.pack(side=tk.LEFT, padx=4)
         self.combo.bind("<<ComboboxSelected>>", self._on_scenario)
 
+        ttk.Label(top, text="策略").pack(side=tk.LEFT, padx=(8, 0))
         self.sim_combo = ttk.Combobox(
             top,
             state="readonly",
-            width=10,
+            width=14,
             values=self._builder_names,
         )
         self.sim_combo.current(self._builder_names.index(self._current_builder_name))
