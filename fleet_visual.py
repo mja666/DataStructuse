@@ -65,6 +65,17 @@ def _vehicle_xy(
     return cxy(v.node)
 
 
+def _vehicle_battery(v, now: float) -> float:
+    segs = getattr(v, "battery_segments", [])
+    for t0, t1, b0, b1 in segs:
+        if t0 - 1e-9 <= now <= t1 + 1e-9:
+            if t1 <= t0 + 1e-12:
+                return b1
+            alpha = max(0.0, min(1.0, (now - t0) / (t1 - t0)))
+            return b0 + alpha * (b1 - b0)
+    return v.battery
+
+
 def _flatten_route_points(segments: list[tuple[float, float, list[int]]], cxy) -> list[tuple[float, float]]:
     pts: list[tuple[float, float]] = []
     for _t0, _t1, path in segments:
@@ -418,7 +429,8 @@ class FleetVisualApp:
                 width=2,
             )
             cap = cfg.battery_capacity
-            ratio = max(0.0, min(1.0, v.battery / cap))
+            cur_bat = _vehicle_battery(v, self.t)
+            ratio = max(0.0, min(1.0, cur_bat / cap))
             bw = cs * 0.5
             bh = 3.5
             self.canvas.create_rectangle(

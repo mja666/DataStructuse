@@ -124,6 +124,8 @@ class Vehicle:
     batch_index: int = 0
     # (段开始时刻, 段结束时刻, 路径顶点序列)；单点或两点相同表示在节点等待（如充电）
     visual_segments: List[Tuple[float, float, List[int]]] = field(default_factory=list)
+    # (段开始, 段结束, 起始电量, 结束电量)，用于可视化平滑显示电量变化
+    battery_segments: List[Tuple[float, float, float, float]] = field(default_factory=list)
 
 
 @dataclass
@@ -445,8 +447,11 @@ class FleetSimulator:
         if need_direct <= v.battery + 1e-9:
             travel_t = self._travel_time(d_direct)
             p = self._path_nodes(from_node, to_node)
+            b0 = v.battery
+            b1 = b0 - need_direct
             v.visual_segments = [(now, now + travel_t, p)] if p else []
-            v.battery -= need_direct
+            v.battery_segments = [(now, now + travel_t, b0, b1)]
+            v.battery = b1
             v.node = to_node
             v.busy_until = now + travel_t
             if record_tid is not None:
@@ -460,8 +465,11 @@ class FleetSimulator:
         e1 = self._energy_need(d1)
 
         t_arrive_c = now + self._travel_time(d1)
-        bat_after_leg1 = v.battery - e1
-        _, charge_end = self._reserve_charge(station, v.vid, t_arrive_c, bat_after_leg1)
+        b0 = v.battery
+        bat_after_leg1 = b0 - e1
+        charge_start, charge_end = self._reserve_charge(
+            station, v.vid, t_arrive_c, bat_after_leg1
+        )
         bat_after = self.cfg.battery_capacity
         e2 = self._energy_need(d2)
         if e2 > bat_after + 1e-9:
@@ -478,7 +486,17 @@ class FleetSimulator:
         v.visual_segments.append((t_arrive_c, charge_end, [cnode, cnode]))
         if p2:
             v.visual_segments.append((charge_end, arrive_task, p2))
-        v.battery = bat_after - e2
+        b_leg1 = bat_after_leg1
+        b_leg2_start = bat_after
+        b_final = bat_after - e2
+        bsegs: List[Tuple[float, float, float, float]] = [(now, t_arrive_c, b0, b_leg1)]
+        if charge_start > t_arrive_c + 1e-9:
+            bsegs.append((t_arrive_c, charge_start, b_leg1, b_leg1))
+        if charge_end > charge_start + 1e-9:
+            bsegs.append((charge_start, charge_end, b_leg1, b_leg2_start))
+        bsegs.append((charge_end, arrive_task, b_leg2_start, b_final))
+        v.battery_segments = bsegs
+        v.battery = b_final
         v.node = to_node
         v.busy_until = arrive_task
         if record_tid is not None:
@@ -537,6 +555,7 @@ class FleetSimulator:
         v.current_task = None
         v.load_used = 0.0
         v.visual_segments = []
+        v.battery_segments = []
 
     def _assign_vehicle(self, v: Vehicle, now: float) -> None:
         if v.node != self.depot:
@@ -607,11 +626,13 @@ class FleetSimulator:
                 v.batch_index = 0
                 v.current_task = None
                 v.visual_segments = []
+                v.battery_segments = []
         else:
             v.carry_batch = []
             v.batch_index = 0
             v.current_task = None
             v.visual_segments = []
+            v.battery_segments = []
 
     def _return_depot(self, v: Vehicle, now: float) -> None:
         if v.node == self.depot:
@@ -623,8 +644,11 @@ class FleetSimulator:
         if need <= v.battery + 1e-9:
             tr = self._travel_time(d_back)
             p = self._path_nodes(v.node, self.depot)
+            b0 = v.battery
+            b1 = b0 - need
             v.visual_segments = [(now, now + tr, p)] if p else []
-            v.battery -= need
+            v.battery_segments = [(now, now + tr, b0, b1)]
+            v.battery = b1
             v.node = self.depot
             v.busy_until = now + tr
             return
@@ -635,8 +659,9 @@ class FleetSimulator:
         station, cnode, d1, d2 = best
         e1 = self._energy_need(d1)
         t_arrive_c = now + self._travel_time(d1)
+        b0 = v.battery
         bat1 = v.battery - e1
-        _, charge_end = self._reserve_charge(station, v.vid, t_arrive_c, bat1)
+        charge_start, charge_end = self._reserve_charge(station, v.vid, t_arrive_c, bat1)
         bat_after = self.cfg.battery_capacity
         e2 = self._energy_need(d2)
         if e2 > bat_after + 1e-9:
@@ -651,7 +676,17 @@ class FleetSimulator:
         v.visual_segments.append((t_arrive_c, charge_end, [cnode, cnode]))
         if p2:
             v.visual_segments.append((charge_end, t_end, p2))
-        v.battery = bat_after - e2
+        b_leg1 = bat1
+        b_leg2_start = bat_after
+        b_final = bat_after - e2
+        bsegs: List[Tuple[float, float, float, float]] = [(now, t_arrive_c, b0, b_leg1)]
+        if charge_start > t_arrive_c + 1e-9:
+            bsegs.append((t_arrive_c, charge_start, b_leg1, b_leg1))
+        if charge_end > charge_start + 1e-9:
+            bsegs.append((charge_start, charge_end, b_leg1, b_leg2_start))
+        bsegs.append((charge_end, t_end, b_leg2_start, b_final))
+        v.battery_segments = bsegs
+        v.battery = b_final
         v.node = self.depot
         v.busy_until = t_end
 
@@ -684,6 +719,7 @@ class FleetSimulator:
                 and v.current_task is None
             ):
                 v.visual_segments = []
+                v.battery_segments = []
 
     def run(self) -> None:
         t = 0.0
