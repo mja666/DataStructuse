@@ -67,6 +67,8 @@ class FleetSimulatorNearestFirst(FleetSimulator):
             return
         if v.carry_batch:
             return
+        if self._try_proactive_depot_charge(v, now):
+            return
         pending = [t for t in self.tasks.values() if t.status == TaskStatus.PENDING]
         raw = pick_batch_greedy_nearest(
             pending, now, self.cfg.load_capacity, self, self.depot, load_already=0.0
@@ -85,10 +87,18 @@ class FleetSimulatorNearestFirst(FleetSimulator):
         if not ordered:
             return
 
+        tour_d = self._tour_distance_with_return([t.node for t in ordered])
+        need_tour = self._energy_need(tour_d)
+        if need_tour > v.battery + 1e-9:
+            if self._try_proactive_depot_charge(v, now):
+                return
+            return
+
         tids = [t.tid for t in ordered]
         for t in ordered:
             t.status = TaskStatus.ASSIGNED
             t.assigned_vehicle = v.vid
+            self._pending_tids.discard(t.tid)
 
         v.carry_batch = tids
         v.batch_index = 0

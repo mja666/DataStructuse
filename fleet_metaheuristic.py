@@ -94,10 +94,12 @@ class MetaHeuristicFleetSimulator(FleetSimulator):
         node = start_node
         late_sum = 0.0
         for t in ordered:
-            cum += self._travel_time(self.dist_uv(node, t.node))
+            pth = self._path_nodes(node, t.node)
+            cum += self._travel_time_for_path(pth)
             late_sum += max(0.0, cum - t.deadline)
             node = t.node
-        cum += self._travel_time(self.dist_uv(node, self.depot))
+        p_back = self._path_nodes(node, self.depot)
+        cum += self._travel_time_for_path(p_back)
         dc = self.cfg.distance_penalty_coef
         lp = self.cfg.late_penalty_per_time
         return dc * dist_tour + lp * late_sum
@@ -234,6 +236,8 @@ class MetaHeuristicFleetSimulator(FleetSimulator):
             return
         if v.carry_batch:
             return
+        if self._try_proactive_depot_charge(v, now):
+            return
         pending = [t for t in self.tasks.values() if t.status == TaskStatus.PENDING]
         raw = pick_batch_weight_then_edd(
             pending, now, self.cfg.load_capacity, load_already=0.0
@@ -254,10 +258,18 @@ class MetaHeuristicFleetSimulator(FleetSimulator):
             if not ordered:
                 return
 
+            tour_d = self._tour_distance_with_return([t.node for t in ordered])
+            need_tour = self._energy_need(tour_d)
+            if need_tour > v.battery + 1e-9:
+                if self._try_proactive_depot_charge(v, now):
+                    return
+                return
+
             tids = [t.tid for t in ordered]
             for t in ordered:
                 t.status = TaskStatus.ASSIGNED
                 t.assigned_vehicle = v.vid
+                self._pending_tids.discard(t.tid)
 
             v.carry_batch = tids
             v.batch_index = 0
@@ -299,6 +311,7 @@ class MetaHeuristicFleetSimulator(FleetSimulator):
                     if tj.status == TaskStatus.ASSIGNED:
                         tj.status = TaskStatus.PENDING
                         tj.assigned_vehicle = None
+                        self._pending_tids.add(tj.tid)
                         v.load_used -= tj.weight
                 v.carry_batch = []
                 v.batch_index = 0
@@ -326,6 +339,8 @@ class MetaHeuristicNearestFleetSimulator(MetaHeuristicFleetSimulator):
             return
         if v.carry_batch:
             return
+        if self._try_proactive_depot_charge(v, now):
+            return
         pending = [t for t in self.tasks.values() if t.status == TaskStatus.PENDING]
         raw = pick_batch_greedy_nearest(
             pending, now, self.cfg.load_capacity, self, self.depot, load_already=0.0
@@ -346,10 +361,18 @@ class MetaHeuristicNearestFleetSimulator(MetaHeuristicFleetSimulator):
             if not ordered:
                 return
 
+            tour_d = self._tour_distance_with_return([t.node for t in ordered])
+            need_tour = self._energy_need(tour_d)
+            if need_tour > v.battery + 1e-9:
+                if self._try_proactive_depot_charge(v, now):
+                    return
+                return
+
             tids = [t.tid for t in ordered]
             for t in ordered:
                 t.status = TaskStatus.ASSIGNED
                 t.assigned_vehicle = v.vid
+                self._pending_tids.discard(t.tid)
 
             v.carry_batch = tids
             v.batch_index = 0

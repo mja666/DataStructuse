@@ -2,11 +2,12 @@
 """
 真实 OSM 路网 + 原车队模型（多车、电量、充电排队、任务动态到达、重量贪心装批 + 最近邻配送）。
 
-- 边权为 Haversine 米；SimConfig.travel_speed 按 m/s、energy_per_distance 按 每米耗电 解释。
+- 边权为 Haversine 米；SimConfig.travel_speed 为名义 m/s。真实地图为每条边单独采样限速（交叉口
+  稠密处易慢、稀疏处易快），行驶时间与可视化插值按边累计。
 - 可视化：Tk，经纬度投影到画布（非格子），车辆沿最短路顶点线性插值移动。
 
-可视化: python fleet_osm.py（可加 --csv）
-批量跑分（仅控制台、较慢）: python fleet_osm_scores.py（见该文件说明，可加 --csv）
+可视化: python fleet_osm.py（可加 --csv、可选 --seed）
+批量跑分: python fleet_osm_scores.py（可加 --csv；默认三档 seed 21/22/23，多次运行同一 CSV 可复现）
 """
 
 from __future__ import annotations
@@ -17,7 +18,7 @@ import random
 import sys
 import tkinter as tk
 from collections import defaultdict, deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from tkinter import ttk
 from typing import Dict, List, Optional, Sequence, Set, Tuple, Type
 
@@ -83,11 +84,12 @@ def _osm_sim_config(
         task_spawn_rate=task_spawn_rate,
         weight_range=(weight_lo, weight_hi),
         deadline_slack_range=(slack_lo, slack_hi),
-        battery_capacity=400.0,
+        # 米制路网：charge_power 越小充满越慢（秒级→分钟级）；energy_per_distance 越大越耗电
+        battery_capacity=560.0,
         load_capacity=220.0,
-        energy_per_distance=0.2,
+        energy_per_distance=0.145,
         travel_speed=10.0,
-        charge_power=85.0,
+        charge_power=19.0,
         early_bonus_per_weight=9.0,
         late_penalty_per_time=14.0,
         distance_penalty_coef=0.008,
@@ -112,7 +114,7 @@ def preset_osm_map_presets() -> List[OSMMapPreset]:
                 "OSM_SMALL",
                 seed=21,
                 num_vehicles=6,
-                num_chargers=4,
+                num_chargers=6,
                 sim_duration=900.0,
                 task_spawn_rate=0.26,
                 weight_lo=6.0,
@@ -131,7 +133,7 @@ def preset_osm_map_presets() -> List[OSMMapPreset]:
                 "OSM_MEDIUM",
                 seed=22,
                 num_vehicles=8,
-                num_chargers=6,
+                num_chargers=8,
                 sim_duration=1200.0,
                 task_spawn_rate=0.32,
                 weight_lo=6.0,
@@ -150,7 +152,7 @@ def preset_osm_map_presets() -> List[OSMMapPreset]:
                 "OSM_LARGE",
                 seed=23,
                 num_vehicles=10,
-                num_chargers=8,
+                num_chargers=10,
                 sim_duration=1500.0,
                 task_spawn_rate=0.38,
                 weight_lo=8.0,
@@ -162,12 +164,39 @@ def preset_osm_map_presets() -> List[OSMMapPreset]:
     ]
 
 
+def osm_presets_for_run(master_seed: Optional[int] = None) -> List[OSMMapPreset]:
+    """
+    获取三档 OSM 预设。master_seed 为 None 时沿用内置 seed（SMALL/MEDIUM/LARGE = 21/22/23），
+    同一 CSV、同一解释器版本下多次跑分结果一致。指定 N 时三档 seed 依次为 N、N+1、N+2。
+    """
+    raw = preset_osm_map_presets()
+    if master_seed is None:
+        return raw
+    out: List[OSMMapPreset] = []
+    for idx, p in enumerate(raw):
+        out.append(
+            OSMMapPreset(
+                name=p.name,
+                south=p.south,
+                west=p.west,
+                north=p.north,
+                east=p.east,
+                cfg=replace(p.cfg, seed=master_seed + idx),
+            )
+        )
+    return out
+
+
 @dataclass(frozen=True)
 class PreparedRoad:
     n: int
     adj: List[List[Tuple[int, float]]]
     depot: int
     node_lonlat: List[Tuple[float, float]]
+    # 无向边 (u,v) 且 u<v：该段上车辆速度 m/s（与稠密度相关的随机值）
+    edge_speed_mps: Dict[Tuple[int, int], float]
+    # 同键：结构稠密程度 [0,1]（端点度归一化），用于拥挤度着色
+    edge_congest_base: Dict[Tuple[int, int], float]
 
 
 def _largest_component(n: int, adj: List[List[Tuple[int, float]]]) -> List[int]:
@@ -213,7 +242,69 @@ def roadgraph_to_int_adj(rg: RoadGraph) -> Tuple[int, List[List[Tuple[int, float
     return n, adj, lonlat
 
 
-def prepare_road_network(segments: Sequence[Segment], rng: random.Random) -> PreparedRoad:
+def _build_edge_speeds_mps(
+    n: int,
+    adj: List[List[Tuple[int, float]]],
+    rng: random.Random,
+    base: float,
+) -> Tuple[Dict[Tuple[int, int], float], Dict[Tuple[int, int], float]]:
+    """
+    为每条无向边采样速度 (m/s)：端点度数越高（路网越密）目标速度越低，反之越高，并加小幅随机。
+    同时返回边的结构稠密度 [0,1]（用于可视化拥挤程度）。
+    """
+    degs = [len(adj[i]) for i in range(n)]
+    dmin = min(degs)
+    dmax = max(degs)
+    span = float(dmax - dmin) + 1e-9
+    norm = [(degs[i] - dmin) / span for i in range(n)]
+    lo_f, hi_f = 0.52, 1.38
+    speeds: Dict[Tuple[int, int], float] = {}
+    cong: Dict[Tuple[int, int], float] = {}
+    for u in range(n):
+        for v, _w in adj[u]:
+            if u >= v:
+                continue
+            dense = 0.5 * (norm[u] + norm[v])
+            cong[(u, v)] = dense
+            v_tgt = base * (lo_f + (1.0 - dense) * (hi_f - lo_f))
+            v_final = max(
+                0.22 * base,
+                min(1.65 * base, v_tgt * rng.uniform(0.86, 1.14)),
+            )
+            speeds[(u, v)] = v_final
+    return speeds, cong
+
+
+def _lerp_rgb(c0: Tuple[int, int, int], c1: Tuple[int, int, int], t: float) -> str:
+    t = max(0.0, min(1.0, t))
+    r = int(c0[0] + (c1[0] - c0[0]) * t + 0.5)
+    g = int(c0[1] + (c1[1] - c0[1]) * t + 0.5)
+    b = int(c0[2] + (c1[2] - c0[2]) * t + 0.5)
+    return f"#{r:02x}{g:02x}{b:02x}"
+
+
+def _edge_congest_visual_level(
+    dense: float, t: float, period: float, u: int, v: int
+) -> float:
+    """随仿真时间周期波动；稠密边底色高、波动幅度大。"""
+    a, b = (u, v) if u < v else (v, u)
+    phase = ((a * 1103515245 + b * 12345) & 0xFFFFFF) / float(0x1000000) * 2.0 * math.pi
+    per = max(period, 1e-3)
+    wave = 0.5 + 0.5 * math.sin(2.0 * math.pi * t / per + phase)
+    return max(0.0, min(1.0, dense * (0.22 + 0.78 * wave)))
+
+
+def _edge_color_for_congest_level(level: float) -> str:
+    lo = (0x3b, 0x42, 0x61)
+    hi = (0xf7, 0x66, 0x6e)
+    return _lerp_rgb(lo, hi, level)
+
+
+def prepare_road_network(
+    segments: Sequence[Segment],
+    rng: random.Random,
+    base_speed_mps: float = 10.0,
+) -> PreparedRoad:
     rg = RoadGraph(segments)
     n_full, adj_full, ll_full = roadgraph_to_int_adj(rg)
     if n_full < 8:
@@ -261,8 +352,17 @@ def prepare_road_network(segments: Sequence[Segment], rng: random.Random) -> Pre
             i,
         ),
     )
-    _ = rng  # 预留：可按 seed 固定仓库规则
-    return PreparedRoad(n=n, adj=adj, depot=depot, node_lonlat=lonlat)
+    edge_speed_mps, edge_congest_base = _build_edge_speeds_mps(
+        n, adj, rng, base_speed_mps
+    )
+    return PreparedRoad(
+        n=n,
+        adj=adj,
+        depot=depot,
+        node_lonlat=lonlat,
+        edge_speed_mps=edge_speed_mps,
+        edge_congest_base=edge_congest_base,
+    )
 
 
 def populate_road_fleet_state(sim: FleetSimulator, cfg: SimConfig, prep: PreparedRoad) -> None:
@@ -275,6 +375,8 @@ def populate_road_fleet_state(sim: FleetSimulator, cfg: SimConfig, prep: Prepare
     sim.depot = prep.depot
     sim.obstacles = set()
     sim.node_lonlat = prep.node_lonlat
+    sim.edge_speed_mps = prep.edge_speed_mps
+    sim.edge_congest_base = prep.edge_congest_base
     sim._non_obstacle_nodes = list(range(sim.n))
     d0, _ = dijkstra(sim.n, sim.adj, sim.depot)
     sim._task_candidate_nodes = [
@@ -286,6 +388,7 @@ def populate_road_fleet_state(sim: FleetSimulator, cfg: SimConfig, prep: Prepare
         raise ValueError("可达任务点不足")
     sim._dist_row_cache = {}
     sim.tasks = {}
+    sim._pending_tids = set()
     sim._next_tid = 0
     sim.vehicles = []
     for i in range(cfg.num_vehicles):
@@ -394,16 +497,24 @@ def build_scenario_triples_from_presets(
     联网：每档独立拉 bbox 并构图。
     CSV：三档共用同一 segments_override，仅 SimConfig 不同（地图几何相同、负载不同）。
     """
-    rng0 = random.Random(0)
     out: List[Tuple[str, PreparedRoad, SimConfig]] = []
     for p in presets:
         if segments_override is not None:
             segs = segments_override
         else:
             segs = load_osm_segments_bbox(p.south, p.west, p.north, p.east)
-        prep = prepare_road_network(segs, rng0)
+        prep = prepare_road_network(
+            segs,
+            random.Random(p.cfg.seed + 17_017),
+            base_speed_mps=p.cfg.travel_speed,
+        )
         out.append((p.name, prep, p.cfg))
     return out
+
+
+# 轨迹点过多时 Tk 折线 + smooth 会极慢；限制长度并避免超长 smooth
+_TRAIL_DEQUE_MAXLEN = 420
+_TRAIL_SAMPLE_DIST = 1.25
 
 
 class FleetOSMVisualApp:
@@ -423,7 +534,14 @@ class FleetOSMVisualApp:
         self.dt = 0.5
         self.running = False
         self.steps_per_tick = 1
-        self._trails: Dict[int, deque] = defaultdict(deque)
+        self._trails: Dict[int, deque] = defaultdict(
+            lambda: deque(maxlen=_TRAIL_DEQUE_MAXLEN)
+        )
+        self._bar_h = 52
+        self._leg_h = 78
+        self._congest_period = float(
+            max(80.0, min(220.0, self.cfg.sim_duration / 5.5))
+        )
 
         self._colors = {
             "bg": "#16161e",
@@ -520,8 +638,8 @@ class FleetOSMVisualApp:
         lon, lat = self.sim.node_lonlat[node]
         W = int(self.canvas.cget("width"))
         H = int(self.canvas.cget("height"))
-        bar_h = 52
-        leg_h = 56
+        bar_h = self._bar_h
+        leg_h = self._leg_h
         pad = 12
         pw = W - 2 * pad
         ph = H - bar_h - leg_h - 2 * pad
@@ -536,6 +654,9 @@ class FleetOSMVisualApp:
         self._pause()
         self.prep = self.scenarios[idx][1]
         self.cfg = self.scenarios[idx][2]
+        self._congest_period = float(
+            max(80.0, min(220.0, self.cfg.sim_duration / 5.5))
+        )
         self._bounds = self._compute_bounds(self.prep.node_lonlat)
         self._restart()
 
@@ -555,7 +676,7 @@ class FleetOSMVisualApp:
         self._pause()
         self.sim = self._new_sim()
         self.t = 0.0
-        self._trails = defaultdict(deque)
+        self._trails = defaultdict(lambda: deque(maxlen=_TRAIL_DEQUE_MAXLEN))
         name = self.scenarios[self._scenario_idx][0]
         self.root.title(f"OSM 车队 · {name} · {self._builder_key}")
 
@@ -571,7 +692,9 @@ class FleetOSMVisualApp:
                 self.running = False
         self.lbl.config(text=f"t={self.t:.1f}/{cfg.sim_duration:.0f}  得分 {self.sim.score:.1f}")
         self._draw()
-        self.root.after(45, self._tick_loop)
+        # 暂停时降低刷新率，减轻 Tk 全画布重绘压力
+        delay_ms = 45 if self.running else 200
+        self.root.after(delay_ms, self._tick_loop)
 
     def _erase_trail_if_idle(self, v: Vehicle) -> None:
         if (
@@ -588,8 +711,8 @@ class FleetOSMVisualApp:
         cfg = self.cfg
         W = int(self.canvas.cget("width"))
         H = int(self.canvas.cget("height"))
-        bar_h = 52
-        leg_h = 56
+        bar_h = self._bar_h
+        leg_h = self._leg_h
         pad = 12
         pw = W - 2 * pad
         ph = H - bar_h - leg_h - 2 * pad
@@ -598,6 +721,7 @@ class FleetOSMVisualApp:
         w0, s0, e0, n0 = self._bounds
 
         seen: Set[Tuple[int, int]] = set()
+        prep = self.prep
         for u in range(sim.n):
             lon_u, lat_u = sim.node_lonlat[u]
             x0, y0 = self._project(lon_u, lat_u, ox, oy, pw, ph)
@@ -611,7 +735,12 @@ class FleetOSMVisualApp:
                 seen.add((a, b))
                 lon_v, lat_v = sim.node_lonlat[v]
                 x1, y1 = self._project(lon_v, lat_v, ox, oy, pw, ph)
-                self.canvas.create_line(x0, y0, x1, y1, fill=self._colors["edge"], width=1)
+                dense = prep.edge_congest_base.get((a, b), 0.35)
+                lvl = _edge_congest_visual_level(
+                    dense, self.t, self._congest_period, a, b
+                )
+                ec = _edge_color_for_congest_level(lvl)
+                self.canvas.create_line(x0, y0, x1, y1, fill=ec, width=1)
 
         cx_d, cy_d = self._cxy(sim.depot)
         self.canvas.create_rectangle(
@@ -642,8 +771,16 @@ class FleetOSMVisualApp:
 
         pending_cnt: Dict[int, int] = defaultdict(int)
         for task in sim.tasks.values():
-            if task.status == TaskStatus.PENDING and task.spawn_time <= self.t:
+            st = task.status
+            if st == TaskStatus.PENDING and task.spawn_time <= self.t:
                 pending_cnt[task.node] += 1
+            elif st == TaskStatus.ASSIGNED:
+                px, py = self._cxy(task.node)
+                self.canvas.create_oval(
+                    px - 6, py - 6, px + 6, py + 6,
+                    outline=self._colors["task_go"],
+                    width=2,
+                )
         for node, k in pending_cnt.items():
             px, py = self._cxy(node)
             for i in range(min(k, 5)):
@@ -657,11 +794,6 @@ class FleetOSMVisualApp:
                     fill=self._colors["task_pend"],
                     outline="",
                 )
-
-        for task in sim.tasks.values():
-            if task.status == TaskStatus.ASSIGNED:
-                px, py = self._cxy(task.node)
-                self.canvas.create_oval(px - 6, py - 6, px + 6, py + 6, outline=self._colors["task_go"], width=2)
 
         for v in sim.vehicles:
             self._erase_trail_if_idle(v)
@@ -683,18 +815,19 @@ class FleetOSMVisualApp:
         for v in sim.vehicles:
             tr = self._trails[v.vid]
             px, py = _vehicle_xy(sim, v, self.t, self._cxy)
-            if not tr or math.hypot(tr[-1][0] - px, tr[-1][1] - py) > 0.8:
+            if not tr or math.hypot(tr[-1][0] - px, tr[-1][1] - py) > _TRAIL_SAMPLE_DIST:
                 tr.append((px, py))
             if len(tr) >= 2:
                 flat = []
                 for p in tr:
                     flat.extend(p)
+                use_smooth = len(tr) <= 96
                 self.canvas.create_line(
                     *flat,
                     fill=self._colors["trail"],
                     width=2,
-                    smooth=True,
-                    splinesteps=8,
+                    smooth=use_smooth,
+                    splinesteps=8 if use_smooth else 12,
                 )
 
         for v in sim.vehicles:
@@ -720,15 +853,51 @@ class FleetOSMVisualApp:
                 outline="",
             )
 
-        ly = H - leg_h + 4
+        ly = H - leg_h + 2
         self.canvas.create_rectangle(0, ly, W, H - 2, fill="#1a1b26", outline="#292e42")
         self.canvas.create_text(
             14,
-            ly + 18,
-            text="■ 仓库  ◆ 充电  · 待接  ○ 配送中  — 规划  灰线 路网",
+            ly + 11,
+            text="■仓库  ◆充电  ·待接  ○配送中  —规划  |  路网颜色=道路拥挤度（疏→青灰，密/高峰→红，随仿真时间周期变化）",
             fill="#a9b1d6",
-            font=("Microsoft YaHei UI", 9),
+            font=("Microsoft YaHei UI", 8),
             anchor=tk.W,
+        )
+        lx_leg = W - 200
+        self.canvas.create_text(
+            lx_leg,
+            ly + 28,
+            text="拥挤度",
+            fill="#787c99",
+            font=("Microsoft YaHei UI", 7),
+            anchor=tk.W,
+        )
+        for i in range(12):
+            ti = i / 11.0
+            x0 = lx_leg + i * 15
+            self.canvas.create_rectangle(
+                x0,
+                ly + 32,
+                x0 + 13,
+                ly + 44,
+                fill=_edge_color_for_congest_level(ti),
+                outline="#292e42",
+            )
+        self.canvas.create_text(
+            lx_leg,
+            ly + 50,
+            text="低（畅通）",
+            fill="#565f89",
+            font=("Microsoft YaHei UI", 7),
+            anchor=tk.W,
+        )
+        self.canvas.create_text(
+            lx_leg + 168,
+            ly + 50,
+            text="高（拥挤）",
+            fill="#565f89",
+            font=("Microsoft YaHei UI", 7),
+            anchor=tk.E,
         )
 
         bx0, bx1 = pad, W - pad
@@ -783,9 +952,16 @@ def run_osm_console_score_batch(scenarios: List[Tuple[str, PreparedRoad, SimConf
 def main() -> int:
     ap = argparse.ArgumentParser(description="OSM 真实路网车队仿真 + 动态可视化（三档规模）")
     ap.add_argument("--csv", metavar="PATH", help="从 CSV 读路网（不联网）；三档共用此路网几何")
+    ap.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        metavar="N",
+        help="三档 SimConfig.seed 设为 N、N+1、N+2；省略则固定为内置 21/22/23（可复现）",
+    )
     args = ap.parse_args()
 
-    presets = preset_osm_map_presets()
+    presets = osm_presets_for_run(args.seed)
     segs_override: Optional[List[Segment]] = None
     if args.csv:
         try:

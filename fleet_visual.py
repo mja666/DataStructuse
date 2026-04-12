@@ -24,6 +24,7 @@ def _interp_on_path(
     now: float,
     dist_uv,
     cxy,
+    sim: FleetSimulator | None = None,
 ) -> tuple[float, float]:
     if not path:
         return cxy(0)
@@ -35,6 +36,24 @@ def _interp_on_path(
         return cxy(path[-1])
     if len(path) == 1 or path[0] == path[-1]:
         return cxy(path[0])
+    dt_total = t1 - t0
+    if sim is not None and getattr(sim, "edge_speed_mps", None) is not None:
+        edge_times = sim._edge_times_along_path(path)
+        sum_t = sum(edge_times)
+        if sum_t < 1e-12:
+            return cxy(path[0])
+        alpha = 0.0 if dt_total < 1e-12 else max(0.0, min(1.0, (now - t0) / dt_total))
+        target_time = alpha * sum_t
+        acc = 0.0
+        for i, te in enumerate(edge_times):
+            if acc + te >= target_time - 1e-9:
+                seg_frac = (target_time - acc) / te if te > 1e-9 else 0.0
+                a, b = path[i], path[i + 1]
+                x0, y0 = cxy(a)
+                x1, y1 = cxy(b)
+                return (x0 + seg_frac * (x1 - x0), y0 + seg_frac * (y1 - y0))
+            acc += te
+        return cxy(path[-1])
     total_d = sum(dist_uv(path[i], path[i + 1]) for i in range(len(path) - 1))
     if total_d < 1e-9:
         return cxy(path[0])
@@ -61,7 +80,7 @@ def _vehicle_xy(
 ) -> tuple[float, float]:
     for t0, t1, path in v.visual_segments:
         if t0 - 1e-9 <= now <= t1 + 1e-9:
-            return _interp_on_path(t0, t1, path, now, sim.dist_uv, cxy)
+            return _interp_on_path(t0, t1, path, now, sim.dist_uv, cxy, sim=sim)
     return cxy(v.node)
 
 

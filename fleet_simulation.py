@@ -261,6 +261,7 @@ class FleetSimulator:
         self._dist_row_cache: Dict[int, Tuple[List[float], List[int]]] = {}
 
         self.tasks: Dict[int, Task] = {}
+        self._pending_tids: Set[int] = set()
         self._next_tid = 0
         self.vehicles: List[Vehicle] = []
         for i in range(cfg.num_vehicles):
@@ -276,6 +277,8 @@ class FleetSimulator:
 
         self.chargers = self._place_chargers(cfg.num_chargers)
         self.score = 0.0
+        # 真实 OSM 路网：每条边独立限速；网格仿真保持 None
+        self.edge_speed_mps: Optional[Dict[Tuple[int, int], float]] = None
 
     def _generate_obstacles(self) -> Set[int]:
         """
@@ -347,10 +350,52 @@ class FleetSimulator:
             deadline=deadline,
         )
         self.tasks[task.tid] = task
+        self._pending_tids.add(task.tid)
         self._next_tid += 1
 
     def _travel_time(self, distance: float) -> float:
         return distance / self.cfg.travel_speed
+
+    def _edge_len(self, u: int, v: int) -> float:
+        for nb, w in self.adj[u]:
+            if nb == v:
+                return w
+        for nb, w in self.adj[v]:
+            if nb == u:
+                return w
+        return math.inf
+
+    def _speed_on_edge(self, u: int, v: int) -> float:
+        m = getattr(self, "edge_speed_mps", None)
+        if not m:
+            return self.cfg.travel_speed
+        a, b = (u, v) if u < v else (v, u)
+        return m.get((a, b), self.cfg.travel_speed)
+
+    def _travel_time_for_path(self, path: List[int]) -> float:
+        if len(path) < 2:
+            return 0.0
+        if getattr(self, "edge_speed_mps", None) is None:
+            tot = 0.0
+            for i in range(len(path) - 1):
+                tot += self._edge_len(path[i], path[i + 1])
+            return tot / max(self.cfg.travel_speed, 1e-9)
+        t = 0.0
+        for i in range(len(path) - 1):
+            a, b = path[i], path[i + 1]
+            d = self._edge_len(a, b)
+            t += d / max(self._speed_on_edge(a, b), 1e-9)
+        return t
+
+    def _edge_times_along_path(self, path: List[int]) -> List[float]:
+        if len(path) < 2:
+            return []
+        out: List[float] = []
+        for i in range(len(path) - 1):
+            a, b = path[i], path[i + 1]
+            d = self._edge_len(a, b)
+            out.append(d / max(self._speed_on_edge(a, b), 1e-9))
+        return out
 
     def _energy_need(self, distance: float) -> float:
         return distance * self.cfg.energy_per_distance
@@ -445,8 +490,8 @@ class FleetSimulator:
 
         need_direct = self._energy_need(d_direct)
         if need_direct <= v.battery + 1e-9:
-            travel_t = self._travel_time(d_direct)
             p = self._path_nodes(from_node, to_node)
+            travel_t = self._travel_time_for_path(p)
             b0 = v.battery
             b1 = b0 - need_direct
             v.visual_segments = [(now, now + travel_t, p)] if p else []
@@ -464,7 +509,9 @@ class FleetSimulator:
         station, cnode, d1, d2 = best
         e1 = self._energy_need(d1)
 
-        t_arrive_c = now + self._travel_time(d1)
+        p1 = self._path_nodes(from_node, cnode)
+        p2 = self._path_nodes(cnode, to_node)
+        t_arrive_c = now + self._travel_time_for_path(p1)
         b0 = v.battery
         bat_after_leg1 = b0 - e1
         charge_start, charge_end = self._reserve_charge(
@@ -476,10 +523,8 @@ class FleetSimulator:
             self._cancel_last_session(station)
             return False
 
-        travel2 = self._travel_time(d2)
+        travel2 = self._travel_time_for_path(p2)
         arrive_task = charge_end + travel2
-        p1 = self._path_nodes(from_node, cnode)
-        p2 = self._path_nodes(cnode, to_node)
         v.visual_segments = []
         if p1:
             v.visual_segments.append((now, t_arrive_c, p1))
@@ -528,7 +573,9 @@ class FleetSimulator:
             if e1 > battery_now + 1e-9:
                 continue
 
-            t_arrive_c = now + self._travel_time(d1)
+            p1 = self._path_nodes(from_node, cnode)
+            p2 = self._path_nodes(cnode, to_node)
+            t_arrive_c = now + self._travel_time_for_path(p1)
             battery_after_leg1 = battery_now - e1
             missing = max(0.0, self.cfg.battery_capacity - battery_after_leg1)
             charge_duration = missing / self.cfg.charge_power
@@ -539,17 +586,89 @@ class FleetSimulator:
             if e2 > self.cfg.battery_capacity + 1e-9:
                 continue
 
-            arrival = charge_end + self._travel_time(d2)
+            arrival = charge_end + self._travel_time_for_path(p2)
             if arrival < best_arrival:
                 best_arrival = arrival
                 best = (cs, cnode, d1, d2)
 
         return best
 
+    def _select_charger_for_depot_topup(self, now: float) -> Optional[ChargingStation]:
+        """从仓库出发：兼顾路程与当前排队，选更合适的充电站。"""
+        if not self.chargers:
+            return None
+
+        def score(cs: ChargingStation) -> Tuple[float, int]:
+            d = self.dist_uv(self.depot, cs.node)
+            q = len(self._charging_sessions_covering(cs, now))
+            return (d + 30.0 * q, cs.sid)
+
+        return min(self.chargers, key=score)
+
+    def _try_proactive_depot_charge(self, v: Vehicle, now: float) -> bool:
+        """
+        在仓库、无车次时：电量偏低则执行「仓库→充电站（充满）→仓库」，
+        为后续派单留余量，减少途中/回仓断电。
+        """
+        if v.node != self.depot or v.carry_batch or v.current_task is not None:
+            return False
+        cfg = self.cfg
+        cap = cfg.battery_capacity
+        if v.battery >= cap * 0.46:
+            return False
+        station = self._select_charger_for_depot_topup(now)
+        if station is None:
+            return False
+        cnode = station.node
+        d1 = self.dist_uv(self.depot, cnode)
+        d2 = self.dist_uv(cnode, self.depot)
+        if math.isinf(d1) or math.isinf(d2):
+            return False
+        e1 = self._energy_need(d1)
+        if e1 > v.battery + 1e-9:
+            return False
+        e2 = self._energy_need(d2)
+        if e2 > cap + 1e-9:
+            return False
+        p1 = self._path_nodes(self.depot, cnode)
+        t_arrive_c = now + self._travel_time_for_path(p1)
+        b0 = v.battery
+        bat_after_leg1 = b0 - e1
+        charge_start, charge_end = self._reserve_charge(
+            station, v.vid, t_arrive_c, bat_after_leg1
+        )
+        bat_after = cap
+        if e2 > bat_after + 1e-9:
+            self._cancel_last_session(station)
+            return False
+        p2 = self._path_nodes(cnode, self.depot)
+        t_end = charge_end + self._travel_time_for_path(p2)
+        v.visual_segments = []
+        if p1:
+            v.visual_segments.append((now, t_arrive_c, p1))
+        v.visual_segments.append((t_arrive_c, charge_end, [cnode, cnode]))
+        if p2:
+            v.visual_segments.append((charge_end, t_end, p2))
+        b_leg1 = bat_after_leg1
+        b_leg2_start = bat_after
+        b_final = bat_after - e2
+        bsegs: List[Tuple[float, float, float, float]] = [(now, t_arrive_c, b0, b_leg1)]
+        if charge_start > t_arrive_c + 1e-9:
+            bsegs.append((t_arrive_c, charge_start, b_leg1, b_leg1))
+        if charge_end > charge_start + 1e-9:
+            bsegs.append((charge_start, charge_end, b_leg1, b_leg2_start))
+        bsegs.append((charge_end, t_end, b_leg2_start, b_final))
+        v.battery_segments = bsegs
+        v.battery = b_final
+        v.node = self.depot
+        v.busy_until = t_end
+        return True
+
     def _rollback_batch(self, v: Vehicle, tids: List[int]) -> None:
         for tid in tids:
             self.tasks[tid].status = TaskStatus.PENDING
             self.tasks[tid].assigned_vehicle = None
+            self._pending_tids.add(tid)
         v.carry_batch = []
         v.batch_index = 0
         v.current_task = None
@@ -561,6 +680,8 @@ class FleetSimulator:
         if v.node != self.depot:
             return
         if v.carry_batch:
+            return
+        if self._try_proactive_depot_charge(v, now):
             return
         pending = [t for t in self.tasks.values() if t.status == TaskStatus.PENDING]
         raw = pick_batch_greedy_max_weight(
@@ -580,10 +701,18 @@ class FleetSimulator:
         if not ordered:
             return
 
+        tour_d = self._tour_distance_with_return([t.node for t in ordered])
+        need_tour = self._energy_need(tour_d)
+        if need_tour > v.battery + 1e-9:
+            if self._try_proactive_depot_charge(v, now):
+                return
+            return
+
         tids = [t.tid for t in ordered]
         for t in ordered:
             t.status = TaskStatus.ASSIGNED
             t.assigned_vehicle = v.vid
+            self._pending_tids.discard(t.tid)
 
         v.carry_batch = tids
         v.batch_index = 0
@@ -621,6 +750,7 @@ class FleetSimulator:
                     if tj.status == TaskStatus.ASSIGNED:
                         tj.status = TaskStatus.PENDING
                         tj.assigned_vehicle = None
+                        self._pending_tids.add(tj.tid)
                         v.load_used -= tj.weight
                 v.carry_batch = []
                 v.batch_index = 0
@@ -642,8 +772,8 @@ class FleetSimulator:
             return
         need = self._energy_need(d_back)
         if need <= v.battery + 1e-9:
-            tr = self._travel_time(d_back)
             p = self._path_nodes(v.node, self.depot)
+            tr = self._travel_time_for_path(p)
             b0 = v.battery
             b1 = b0 - need
             v.visual_segments = [(now, now + tr, p)] if p else []
@@ -655,10 +785,28 @@ class FleetSimulator:
 
         best = self._best_charger_plan(v.node, self.depot, now, v.battery)
         if best is None:
+            # 仍无法经站回仓：仅极低电量时做小幅应急（优先靠主动补能与规划）
+            cfg = self.cfg
+            b0 = v.battery
+            if b0 >= cfg.battery_capacity * 0.12:
+                return
+            need_back = self._energy_need(d_back)
+            gain = max(cfg.battery_capacity * 0.32, need_back * 0.45 + 50.0)
+            b1 = min(cfg.battery_capacity, b0 + gain)
+            if b1 <= b0 + 1e-6:
+                return
+            dur = 12.0
+            v.visual_segments = [(now, now + dur, [v.node, v.node])]
+            v.battery_segments = [(now, now + dur, b0, b1)]
+            v.battery = b1
+            v.busy_until = now + dur
+            self.score -= max(12.0, 0.025 * cfg.late_penalty_per_time * 100.0)
             return
         station, cnode, d1, d2 = best
         e1 = self._energy_need(d1)
-        t_arrive_c = now + self._travel_time(d1)
+        p1 = self._path_nodes(v.node, cnode)
+        p2 = self._path_nodes(cnode, self.depot)
+        t_arrive_c = now + self._travel_time_for_path(p1)
         b0 = v.battery
         bat1 = v.battery - e1
         charge_start, charge_end = self._reserve_charge(station, v.vid, t_arrive_c, bat1)
@@ -667,9 +815,7 @@ class FleetSimulator:
         if e2 > bat_after + 1e-9:
             self._cancel_last_session(station)
             return
-        p1 = self._path_nodes(v.node, cnode)
-        p2 = self._path_nodes(cnode, self.depot)
-        t_end = charge_end + self._travel_time(d2)
+        t_end = charge_end + self._travel_time_for_path(p2)
         v.visual_segments = []
         if p1:
             v.visual_segments.append((now, t_arrive_c, p1))
@@ -707,9 +853,14 @@ class FleetSimulator:
             if v.busy_until <= t + 1e-9 and v.current_task is None:
                 self._assign_vehicle(v, t)
 
-        for task in self.tasks.values():
-            if task.status == TaskStatus.PENDING and t > task.deadline:
+        for tid in list(self._pending_tids):
+            task = self.tasks.get(tid)
+            if task is None or task.status != TaskStatus.PENDING:
+                self._pending_tids.discard(tid)
+                continue
+            if t > task.deadline:
                 task.status = TaskStatus.EXPIRED
+                self._pending_tids.discard(tid)
                 self.score -= cfg.late_penalty_per_time * (t - task.deadline)
 
         for v in self.vehicles:
