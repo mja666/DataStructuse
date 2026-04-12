@@ -5,8 +5,8 @@
 - 边权为 Haversine 米；SimConfig.travel_speed 按 m/s、energy_per_distance 按 每米耗电 解释。
 - 可视化：Tk，经纬度投影到画布（非格子），车辆沿最短路顶点线性插值移动。
 
-运行: python fleet_osm.py
-离线: python fleet_osm.py --csv osm_sample_segments.csv
+可视化: python fleet_osm.py（可加 --csv）
+批量跑分（仅控制台、较慢）: python fleet_osm_scores.py（见该文件说明，可加 --csv）
 """
 
 from __future__ import annotations
@@ -19,8 +19,13 @@ import tkinter as tk
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from tkinter import ttk
-from typing import Dict, List, Optional, Sequence, Set, Tuple
+from typing import Dict, List, Optional, Sequence, Set, Tuple, Type
 
+from fleet_metaheuristic import (
+    MetaHeuristicFleetSimulator,
+    MetaHeuristicNearestFleetSimulator,
+)
+from fleet_nearest_first import FleetSimulatorNearestFirst
 from fleet_simulation import (
     ChargingStation,
     FleetSimulator,
@@ -43,8 +48,118 @@ from osm_graph import (
 )
 
 
-# 与 osm_fetch_demo 默认 bbox 一致的小片区域（可改）
-BBOX_SOUTH, BBOX_WEST, BBOX_NORTH, BBOX_EAST = 55.9448, -3.1915, 55.9478, -3.1865
+@dataclass(frozen=True)
+class OSMMapPreset:
+    """真实地图一档：经纬度 bbox + 与路网规模配套的仿真参数（无 XL_STRESS）。"""
+
+    name: str
+    south: float
+    west: float
+    north: float
+    east: float
+    cfg: SimConfig
+
+
+def _osm_sim_config(
+    name: str,
+    seed: int,
+    num_vehicles: int,
+    num_chargers: int,
+    sim_duration: float,
+    task_spawn_rate: float,
+    weight_lo: float,
+    weight_hi: float,
+    slack_lo: float,
+    slack_hi: float,
+) -> SimConfig:
+    """米制路网共用物理系数；仅规模与到达率等随档位变化。"""
+    return SimConfig(
+        name=name,
+        rows=1,
+        cols=1,
+        num_vehicles=num_vehicles,
+        num_chargers=num_chargers,
+        sim_duration=sim_duration,
+        task_spawn_rate=task_spawn_rate,
+        weight_range=(weight_lo, weight_hi),
+        deadline_slack_range=(slack_lo, slack_hi),
+        battery_capacity=400.0,
+        load_capacity=220.0,
+        energy_per_distance=0.2,
+        travel_speed=10.0,
+        charge_power=85.0,
+        early_bonus_per_weight=9.0,
+        late_penalty_per_time=14.0,
+        distance_penalty_coef=0.008,
+        obstacle_cover_ratio=0.0,
+        seed=seed,
+    )
+
+
+def preset_osm_map_presets() -> List[OSMMapPreset]:
+    """
+    三档规模：同一城市片区（爱丁堡老城附近）由小到大 bbox，车辆/充电/时长/任务率递增。
+    坐标可与课程 OSM 试验一致；若 Overpass 超时请缩小 LARGE 或换镜像。
+    """
+    return [
+        OSMMapPreset(
+            name="OSM_SMALL",
+            south=55.9448,
+            west=-3.1915,
+            north=55.9478,
+            east=-3.1865,
+            cfg=_osm_sim_config(
+                "OSM_SMALL",
+                seed=21,
+                num_vehicles=6,
+                num_chargers=4,
+                sim_duration=900.0,
+                task_spawn_rate=0.26,
+                weight_lo=6.0,
+                weight_hi=42.0,
+                slack_lo=200.0,
+                slack_hi=400.0,
+            ),
+        ),
+        OSMMapPreset(
+            name="OSM_MEDIUM",
+            south=55.9436,
+            west=-3.1935,
+            north=55.9490,
+            east=-3.1845,
+            cfg=_osm_sim_config(
+                "OSM_MEDIUM",
+                seed=22,
+                num_vehicles=8,
+                num_chargers=6,
+                sim_duration=1200.0,
+                task_spawn_rate=0.32,
+                weight_lo=6.0,
+                weight_hi=55.0,
+                slack_lo=160.0,
+                slack_hi=380.0,
+            ),
+        ),
+        OSMMapPreset(
+            name="OSM_LARGE",
+            south=55.9413,
+            west=-3.1970,
+            north=55.9513,
+            east=-3.1810,
+            cfg=_osm_sim_config(
+                "OSM_LARGE",
+                seed=23,
+                num_vehicles=10,
+                num_chargers=8,
+                sim_duration=1500.0,
+                task_spawn_rate=0.38,
+                weight_lo=8.0,
+                weight_hi=70.0,
+                slack_lo=130.0,
+                slack_hi=340.0,
+            ),
+        ),
+    ]
 
 
 @dataclass(frozen=True)
@@ -150,29 +265,47 @@ def prepare_road_network(segments: Sequence[Segment], rng: random.Random) -> Pre
     return PreparedRoad(n=n, adj=adj, depot=depot, node_lonlat=lonlat)
 
 
-def default_osm_sim_config() -> SimConfig:
-    """米制路网：travel_speed≈m/s，energy_per_distance=每米耗电，时间与网格仿真同为「秒」。"""
-    return SimConfig(
-        name="OSM_FLEET",
-        rows=1,
-        cols=1,
-        num_vehicles=4,
-        num_chargers=3,
-        sim_duration=900.0,
-        task_spawn_rate=0.28,
-        weight_range=(6.0, 45.0),
-        deadline_slack_range=(200.0, 420.0),
-        battery_capacity=400.0,
-        load_capacity=220.0,
-        energy_per_distance=0.2,
-        travel_speed=10.0,
-        charge_power=85.0,
-        early_bonus_per_weight=9.0,
-        late_penalty_per_time=14.0,
-        distance_penalty_coef=0.008,
-        obstacle_cover_ratio=0.0,
-        seed=11,
-    )
+def populate_road_fleet_state(sim: FleetSimulator, cfg: SimConfig, prep: PreparedRoad) -> None:
+    """在任意 FleetSimulator 子类实例上写入 OSM 路网与车队初态（不调用网格版 ``__init__``）。"""
+    sim.cfg = cfg
+    random.seed(cfg.seed)
+    sim._rng = random.Random(cfg.seed)
+    sim.n = prep.n
+    sim.adj = prep.adj
+    sim.depot = prep.depot
+    sim.obstacles = set()
+    sim.node_lonlat = prep.node_lonlat
+    sim._non_obstacle_nodes = list(range(sim.n))
+    d0, _ = dijkstra(sim.n, sim.adj, sim.depot)
+    sim._task_candidate_nodes = [
+        i
+        for i in sim._non_obstacle_nodes
+        if i != sim.depot and not math.isinf(d0[i])
+    ]
+    if len(sim._task_candidate_nodes) < 2:
+        raise ValueError("可达任务点不足")
+    sim._dist_row_cache = {}
+    sim.tasks = {}
+    sim._next_tid = 0
+    sim.vehicles = []
+    for i in range(cfg.num_vehicles):
+        sim.vehicles.append(
+            Vehicle(
+                vid=i,
+                node=sim.depot,
+                battery=cfg.battery_capacity,
+                load_used=0.0,
+                busy_until=0.0,
+            )
+        )
+    pool = [i for i in sim._non_obstacle_nodes if i != sim.depot]
+    sim._rng.shuffle(pool)
+    k = min(cfg.num_chargers, len(pool))
+    chosen = pool[:k]
+    sim.chargers = [
+        ChargingStation(sid=i, node=node, slots=2) for i, node in enumerate(chosen)
+    ]
+    sim.score = 0.0
 
 
 class FleetSimulatorRoad(FleetSimulator):
@@ -181,60 +314,111 @@ class FleetSimulatorRoad(FleetSimulator):
     node_lonlat: List[Tuple[float, float]]
 
     def __init__(self, cfg: SimConfig, prep: PreparedRoad) -> None:
-        self.cfg = cfg
-        random.seed(cfg.seed)
-        self._rng = random.Random(cfg.seed)
-        self.n = prep.n
-        self.adj = prep.adj
-        self.depot = prep.depot
-        self.obstacles = set()
-        self.node_lonlat = prep.node_lonlat
-        self._non_obstacle_nodes = list(range(self.n))
-        d0, _ = dijkstra(self.n, self.adj, self.depot)
-        self._task_candidate_nodes = [
-            i
-            for i in self._non_obstacle_nodes
-            if i != self.depot and not math.isinf(d0[i])
-        ]
-        if len(self._task_candidate_nodes) < 2:
-            raise ValueError("可达任务点不足")
-        self._dist_row_cache: Dict[int, Tuple[List[float], List[int]]] = {}
-        self.tasks: Dict[int, Task] = {}
-        self._next_tid = 0
-        self.vehicles: List[Vehicle] = []
-        for i in range(cfg.num_vehicles):
-            self.vehicles.append(
-                Vehicle(
-                    vid=i,
-                    node=self.depot,
-                    battery=cfg.battery_capacity,
-                    load_used=0.0,
-                    busy_until=0.0,
-                )
-            )
-        pool = [i for i in self._non_obstacle_nodes if i != self.depot]
-        self._rng.shuffle(pool)
-        k = min(cfg.num_chargers, len(pool))
-        chosen = pool[:k]
-        self.chargers = [
-            ChargingStation(sid=i, node=node, slots=2) for i, node in enumerate(chosen)
-        ]
-        self.score = 0.0
+        populate_road_fleet_state(self, cfg, prep)
 
 
-def load_osm_segments(use_network: bool) -> List[Segment]:
-    if use_network:
-        data = fetch_overpass(build_overpass_query(BBOX_SOUTH, BBOX_WEST, BBOX_NORTH, BBOX_EAST))
-        return segments_from_osm_json(data)
-    raise RuntimeError("use_network=False 时应走 CSV 分支")
+class FleetSimulatorNearestFirstRoad(FleetSimulatorNearestFirst):
+    """最近任务装批 + OSM 路网。"""
+
+    node_lonlat: List[Tuple[float, float]]
+
+    def __init__(self, cfg: SimConfig, prep: PreparedRoad) -> None:
+        populate_road_fleet_state(self, cfg, prep)
+
+
+class MetaHeuristicFleetSimulatorRoad(MetaHeuristicFleetSimulator):
+    """元启发（重量装批）+ OSM 路网。"""
+
+    node_lonlat: List[Tuple[float, float]]
+
+    def __init__(self, cfg: SimConfig, prep: PreparedRoad) -> None:
+        populate_road_fleet_state(self, cfg, prep)
+        self._meta_rng = random.Random(cfg.seed + 90_210)
+        self.stranded_penalty = max(2000.0, 80.0 * cfg.late_penalty_per_time)
+        self.stranded_events = 0
+
+
+class MetaHeuristicNearestFleetSimulatorRoad(MetaHeuristicNearestFleetSimulator):
+    """元启发（最近装批）+ OSM 路网。"""
+
+    node_lonlat: List[Tuple[float, float]]
+
+    def __init__(self, cfg: SimConfig, prep: PreparedRoad) -> None:
+        populate_road_fleet_state(self, cfg, prep)
+        self._meta_rng = random.Random(cfg.seed + 90_210)
+        self.stranded_penalty = max(2000.0, 80.0 * cfg.late_penalty_per_time)
+        self.stranded_events = 0
+
+
+OSM_SIM_BUILDERS: Dict[str, Type[FleetSimulator]] = {
+    "最大任务": FleetSimulatorRoad,
+    "最近任务": FleetSimulatorNearestFirstRoad,
+    "元启发·重量": MetaHeuristicFleetSimulatorRoad,
+    "元启发·最近": MetaHeuristicNearestFleetSimulatorRoad,
+}
+
+
+def _print_osm_score_matrix(
+    scenario_order: Sequence[str],
+    strat_keys: Sequence[str],
+    scores: Dict[str, Dict[str, float]],
+) -> None:
+    """控制台：每种规模 × 每种策略的最终 sim.score 对齐表。"""
+    c0 = max(len("规模"), *(len(n) for n in scenario_order))
+    widths = [max(len(k), 14) for k in strat_keys]
+    sep = "  "
+    head = "规模".ljust(c0)
+    for k, w in zip(strat_keys, widths):
+        head += sep + k.ljust(w)
+    print(head)
+    print("-" * len(head))
+    for name in scenario_order:
+        line = name.ljust(c0)
+        row = scores.get(name, {})
+        for k, w in zip(strat_keys, widths):
+            v = row.get(k, float("nan"))
+            line += sep + f"{v:.2f}".rjust(w)
+        print(line)
+
+
+def load_osm_segments_bbox(south: float, west: float, north: float, east: float) -> List[Segment]:
+    data = fetch_overpass(build_overpass_query(south, west, north, east))
+    return segments_from_osm_json(data)
+
+
+def build_scenario_triples_from_presets(
+    presets: Sequence[OSMMapPreset],
+    segments_override: Optional[List[Segment]],
+) -> List[Tuple[str, PreparedRoad, SimConfig]]:
+    """
+    联网：每档独立拉 bbox 并构图。
+    CSV：三档共用同一 segments_override，仅 SimConfig 不同（地图几何相同、负载不同）。
+    """
+    rng0 = random.Random(0)
+    out: List[Tuple[str, PreparedRoad, SimConfig]] = []
+    for p in presets:
+        if segments_override is not None:
+            segs = segments_override
+        else:
+            segs = load_osm_segments_bbox(p.south, p.west, p.north, p.east)
+        prep = prepare_road_network(segs, rng0)
+        out.append((p.name, prep, p.cfg))
+    return out
 
 
 class FleetOSMVisualApp:
-    def __init__(self, root: tk.Tk, prep: PreparedRoad, cfg: SimConfig) -> None:
+    def __init__(
+        self,
+        root: tk.Tk,
+        scenarios: List[Tuple[str, PreparedRoad, SimConfig]],
+    ) -> None:
         self.root = root
-        self.prep = prep
-        self.cfg = cfg
-        self.sim = FleetSimulatorRoad(cfg, prep)
+        self.scenarios = scenarios
+        self._scenario_idx = 0
+        self._builder_key = "最大任务"
+        self.prep = scenarios[0][1]
+        self.cfg = scenarios[0][2]
+        self.sim = self._new_sim()
         self.t = 0.0
         self.dt = 0.5
         self.running = False
@@ -266,10 +450,33 @@ class FleetOSMVisualApp:
             "#c0caf5",
         ]
 
-        self._bounds = self._compute_bounds(prep.node_lonlat)
+        self._bounds = self._compute_bounds(self.prep.node_lonlat)
 
         top = ttk.Frame(root, padding=4)
         top.pack(fill=tk.X)
+        ttk.Label(top, text="规模").pack(side=tk.LEFT, padx=(0, 4))
+        self.combo = ttk.Combobox(
+            top,
+            state="readonly",
+            width=14,
+            values=[s[0] for s in scenarios],
+        )
+        self.combo.current(0)
+        self.combo.pack(side=tk.LEFT, padx=4)
+        self.combo.bind("<<ComboboxSelected>>", self._on_scenario)
+
+        ttk.Label(top, text="策略").pack(side=tk.LEFT, padx=(12, 4))
+        self.strategy_combo = ttk.Combobox(
+            top,
+            state="readonly",
+            width=14,
+            values=list(OSM_SIM_BUILDERS.keys()),
+        )
+        _bk = list(OSM_SIM_BUILDERS.keys())
+        self.strategy_combo.current(_bk.index(self._builder_key) if self._builder_key in _bk else 0)
+        self.strategy_combo.pack(side=tk.LEFT, padx=4)
+        self.strategy_combo.bind("<<ComboboxSelected>>", self._on_strategy)
+
         ttk.Button(top, text="▶", width=3, command=self._play).pack(side=tk.LEFT, padx=2)
         ttk.Button(top, text="⏸", width=3, command=self._pause).pack(side=tk.LEFT, padx=2)
         ttk.Button(top, text="↻", width=3, command=self._restart).pack(side=tk.LEFT, padx=2)
@@ -287,6 +494,10 @@ class FleetOSMVisualApp:
 
         self._restart()
         self._tick_loop()
+
+    def _new_sim(self) -> FleetSimulator:
+        cls = OSM_SIM_BUILDERS[self._builder_key]
+        return cls(self.cfg, self.prep)
 
     def _compute_bounds(
         self, lonlat: List[Tuple[float, float]], pad_ratio: float = 0.06
@@ -317,6 +528,23 @@ class FleetOSMVisualApp:
         ox, oy = pad, pad
         return self._project(lon, lat, ox, oy, pw, ph)
 
+    def _on_scenario(self, _evt=None) -> None:
+        idx = self.combo.current()
+        if idx < 0:
+            idx = 0
+        self._scenario_idx = idx
+        self._pause()
+        self.prep = self.scenarios[idx][1]
+        self.cfg = self.scenarios[idx][2]
+        self._bounds = self._compute_bounds(self.prep.node_lonlat)
+        self._restart()
+
+    def _on_strategy(self, _evt=None) -> None:
+        key = self.strategy_combo.get().strip()
+        if key in OSM_SIM_BUILDERS:
+            self._builder_key = key
+        self._restart()
+
     def _play(self) -> None:
         self.running = True
 
@@ -325,9 +553,11 @@ class FleetOSMVisualApp:
 
     def _restart(self) -> None:
         self._pause()
-        self.sim = FleetSimulatorRoad(self.cfg, self.prep)
+        self.sim = self._new_sim()
         self.t = 0.0
         self._trails = defaultdict(deque)
+        name = self.scenarios[self._scenario_idx][0]
+        self.root.title(f"OSM 车队 · {name} · {self._builder_key}")
 
     def _tick_loop(self) -> None:
         cfg = self.cfg
@@ -520,48 +750,59 @@ class FleetOSMVisualApp:
         self.canvas.create_polygon(sx, by0 - 4, sx - 4, by0 - 11, sx + 4, by0 - 11, fill=col, outline="")
 
 
+def run_osm_console_score_batch(scenarios: List[Tuple[str, PreparedRoad, SimConfig]]) -> None:
+    """三档 × 四种策略各跑满时长，向 stdout 打印跑分行、summarize 与汇总矩阵。"""
+    if hasattr(sys.stdout, "reconfigure"):
+        try:
+            sys.stdout.reconfigure(encoding="utf-8")
+            sys.stderr.reconfigure(encoding="utf-8")
+        except Exception:
+            pass
+    strat_keys = list(OSM_SIM_BUILDERS.keys())
+    scenario_order = [n for n, _p, _c in scenarios]
+    score_table: Dict[str, Dict[str, float]] = {n: {} for n in scenario_order}
+    for name, prep, cfg in scenarios:
+        for skey, cls in OSM_SIM_BUILDERS.items():
+            sim = cls(cfg, prep)
+            t = 0.0
+            dt = 0.5
+            while t <= cfg.sim_duration:
+                sim.step(t, dt)
+                t += dt
+            score_table[name][skey] = sim.score
+            print(f"跑分 | {name} | {skey} | {sim.score:.2f}")
+            print(f"=== {name} | {skey} ===")
+            print(summarize(sim))
+            print()
+    print("==== OSM 跑分汇总（每种规模 × 每种策略，列=最终 sim.score）====")
+    _print_osm_score_matrix(scenario_order, strat_keys, score_table)
+    print()
+    sys.stdout.flush()
+
+
 def main() -> int:
-    ap = argparse.ArgumentParser(description="OSM 真实路网车队仿真 + 动态可视化")
-    ap.add_argument("--csv", metavar="PATH", help="从 CSV 读路网（不联网）")
-    ap.add_argument("--no-gui", action="store_true", help="只建图并跑完仿真打印摘要，不打开窗口")
+    ap = argparse.ArgumentParser(description="OSM 真实路网车队仿真 + 动态可视化（三档规模）")
+    ap.add_argument("--csv", metavar="PATH", help="从 CSV 读路网（不联网）；三档共用此路网几何")
     args = ap.parse_args()
 
+    presets = preset_osm_map_presets()
+    segs_override: Optional[List[Segment]] = None
+    if args.csv:
+        try:
+            segs_override = load_segments_csv(args.csv)
+        except Exception as e:
+            print("读取 CSV 失败:", e, file=sys.stderr)
+            return 1
+
     try:
-        if args.csv:
-            segs = load_segments_csv(args.csv)
-        else:
-            segs = load_osm_segments(True)
+        scenarios = build_scenario_triples_from_presets(presets, segs_override)
     except Exception as e:
-        print("加载路网失败:", e, file=sys.stderr)
+        print("构建路网/场景失败:", e, file=sys.stderr)
         return 1
-
-    rng = random.Random(0)
-    try:
-        prep = prepare_road_network(segs, rng)
-    except ValueError as e:
-        print(e, file=sys.stderr)
-        return 1
-
-    cfg = default_osm_sim_config()
-    print(
-        f"路网顶点 n={prep.n}，仓库节点={prep.depot}，"
-        f"车辆={cfg.num_vehicles}，充电站={cfg.num_chargers}"
-    )
-
-    if args.no_gui:
-        sim = FleetSimulatorRoad(cfg, prep)
-        t = 0.0
-        dt = 0.5
-        while t <= cfg.sim_duration:
-            sim.step(t, dt)
-            t += dt
-        print(summarize(sim))
-        return 0
 
     root = tk.Tk()
-    root.title("OSM 车队 · 真实路网")
     root.geometry("1200x860")
-    FleetOSMVisualApp(root, prep, cfg)
+    FleetOSMVisualApp(root, scenarios)
     root.mainloop()
     return 0
 

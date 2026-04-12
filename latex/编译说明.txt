@@ -1,0 +1,45 @@
+simulation_methodology.tex — 编译不出来时请看本说明
+
+零、若以前编译死循环 / 一直失败：先删掉同目录下的
+  simulation_methodology.aux、.out、.toc（以及 .synctex(busy) 若存在），再按下面用 XeLaTeX 编两遍。
+
+一、请用 XeLaTeX，不要用 pdfLaTeX
+--------------------------------
+本工程使用 ctexart（中文）。在 TeXworks、TeXstudio、VS Code LaTeX Workshop 里，
+请把「编译引擎」设为 XeLaTeX，或在 latex 文件夹打开终端执行：
+
+  xelatex simulation_methodology.tex
+  xelatex simulation_methodology.tex
+
+（第二遍可消除交叉引用警告。）
+
+若误用 pdfLaTeX，在 Windows + 中文 + OneDrive 目录下，常出现：
+  - 长时间无输出、CPU 占用但 PDF 迟迟不生成；
+  - 或字体相关处理极慢。
+这与「代码有错」无关，而是引擎选择不当。
+
+二、OneDrive 同步可能导致「卡住」或文件锁
+--------------------------------
+项目若在 OneDrive 下，编译会反复读写 .aux / .pdf / .synctex.gz。
+同步软件可能锁住文件，出现 .synctex(busy) 或 PDF 无法覆盖。
+
+建议任选其一：
+  1）暂时暂停该文件夹同步，再编译；
+  2）把整个 latex 文件夹复制到本机非同步目录（如 D:\work\latex）再编译；
+  3）关闭 PDF 阅读器对生成中 PDF 的独占打开。
+
+若存在 simulation_methodology.synctex(busy) 且已结束所有 TeX 进程，
+可手动删除该文件后重试。
+
+三、PDF 在哪里
+--------------------------------
+成功时，PDF 与 .tex 同目录：
+
+  DataStructure\latex\simulation_methodology.pdf
+
+若在编辑器里「编译了但看不到」，请确认打开的是上述路径，而不是别的副本。
+
+四、仍失败时
+--------------------------------
+打开 simulation_methodology.log，搜索以 ! 开头的行（LaTeX 致命错误），
+或把 log 最后 80 行发给别人排查。
