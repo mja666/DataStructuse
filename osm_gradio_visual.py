@@ -997,6 +997,14 @@ def build_gradio_app(fleet_osm_mod: Any, fleet_osm_path: Optional[str]):
         ctl["paused"] = False
         return f"已请求重新开始（当前运行ID: {ctl.get('run_token', 0)}）", session_key
 
+    def _reset_all(sess_key: str):
+        if sess_key in run_controls:
+            run_controls[sess_key]["run_token"] = -1
+        return (
+            strategies[0], scales[0], -1, 0.5, 240, 2, 10, False, False, False, None,
+            None, None, None, gr.update(value="", visible=False), ""
+        )
+
     with gr.Blocks(title="智慧物流运输模拟") as demo:
         gr.Markdown("## 智慧物流运输模拟")
         gr.Markdown(
@@ -1027,6 +1035,7 @@ def build_gradio_app(fleet_osm_mod: Any, fleet_osm_path: Optional[str]):
             btn = gr.Button("生成动画", variant="primary")
             pause_btn = gr.Button("暂停/继续")
             restart_btn = gr.Button("重新开始")
+            reset_btn = gr.Button("重新设置选项")
 
         with gr.Row():
             preview_canvas = gr.Image(type="numpy", label="实时画布")
@@ -1067,6 +1076,17 @@ def build_gradio_app(fleet_osm_mod: Any, fleet_osm_path: Optional[str]):
             _restart_live,
             inputs=[session_key],
             outputs=[summary, session_key],
+            queue=False,
+        )
+
+        reset_btn.click(
+            _reset_all,
+            inputs=[session_key],
+            outputs=[
+                strategy, scale_name, seed_val, dt, duration_s, steps_per_frame, fps,
+                use_osm_basemap, show_battery, export_mp4, uploaded_map_file,
+                preview_canvas, score_curve, download, summary, session_key
+            ],
             queue=False,
         )
 
@@ -1112,6 +1132,8 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
 
 
 
