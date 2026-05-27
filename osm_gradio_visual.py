@@ -59,6 +59,28 @@ BASEMAP_CACHE_DIR = WORKSPACE_DIR / "basemap_cache"
 MAX_ANIMATION_DURATION_S = 1800.0
 
 
+def _apply_task_spawn_cap(sim: Any, max_tasks: Optional[int]) -> None:
+    if max_tasks is None:
+        return
+    try:
+        max_tasks_int = int(max_tasks)
+    except (TypeError, ValueError):
+        return
+    if max_tasks_int <= 0:
+        return
+    orig_spawn = getattr(sim, "_spawn_task", None)
+    if not callable(orig_spawn):
+        return
+
+    def _spawn_task_capped(t: float, _orig=orig_spawn) -> None:
+        if len(getattr(sim, "tasks", {})) >= max_tasks_int:
+            return
+        _orig(t)
+
+    sim._spawn_task = _spawn_task_capped  # type: ignore[assignment]
+    sim._task_spawn_cap = max_tasks_int  # for summary output
+
+
 def _get_cjk_font_properties() -> Optional[font_manager.FontProperties]:
     cached = getattr(_get_cjk_font_properties, "_cache", None)
     if cached is not None:
@@ -369,6 +391,7 @@ def _build_animation_runtime(
     use_osm_basemap: bool,
     show_battery: bool,
     segments_override: Optional[Sequence[Any]] = None,
+    max_task_count: Optional[int] = None,
 ) -> Dict[str, Any]:
     scenarios = _prepare_scenarios(
         fleet_osm_mod,
@@ -383,6 +406,8 @@ def _build_animation_runtime(
     prep, cfg = scenarios[scale_name]
     sim_cls = fleet_osm_mod.OSM_SIM_BUILDERS[strategy]
     sim = sim_cls(cfg, prep)
+    _apply_task_spawn_cap(sim, max_task_count)
+
     # Keep live duration aligned with UI slider max instead of preset-specific sim_duration.
     duration_limit = max(0.5, min(float(duration_s), MAX_ANIMATION_DURATION_S))
     sim_t = 0.0
@@ -636,17 +661,20 @@ def _build_animation_runtime(
             "duration_limit": duration_limit,
             "sim": sim,
             "basemap_cache_hit": basemap_cache_hit,
+            "task_cap": getattr(sim, "_task_spawn_cap", None),
         },
     }
 
 
 def _summary_text(base: Dict[str, Any], n_frames: int, media: str, writer_used: str) -> str:
     sim = base["sim"]
+    cap = base.get("task_cap")
+    cap_text = f", task_cap={cap}" if isinstance(cap, int) and cap > 0 else ""
     return (
         f"Done. strategy={base['strategy']}, scale={base['scale_name']}, dt={base['dt']}, "
         f"steps/frame={base['steps_per_frame']}, fps={int(base.get('fps', 0) or 0)}, "
         f"duration={base['duration_limit']:.1f}s, score={sim.score:.2f}, frames={n_frames}, "
-        f"media={media}, writer={writer_used}, basemap_cache={'hit' if base['basemap_cache_hit'] else 'miss'}"
+        f"media={media}, writer={writer_used}{cap_text}, basemap_cache={'hit' if base['basemap_cache_hit'] else 'miss'}"
     )
 
 
@@ -714,6 +742,7 @@ def stream_live_canvas_frames(
     use_osm_basemap: bool,
     show_battery: bool,
     segments_override: Optional[Sequence[Any]] = None,
+    max_task_count: Optional[int] = None,
 ):
     rt = _build_animation_runtime(
         fleet_osm_mod,
@@ -727,6 +756,7 @@ def stream_live_canvas_frames(
         use_osm_basemap,
         show_battery,
         segments_override,
+        max_task_count,
     )
     fig = rt["fig"]
     update = rt["update"]
@@ -768,6 +798,7 @@ def render_animation(
     show_battery: bool,
     out_dir: Path,
     segments_override: Optional[Sequence[Any]] = None,
+    max_task_count: Optional[int] = None,
 ) -> Tuple[str, str, str]:
     strategy_slug = _ascii_safe(strategy)
     rt = _build_animation_runtime(
@@ -782,6 +813,7 @@ def render_animation(
         use_osm_basemap,
         show_battery,
         segments_override,
+        max_task_count,
     )
     fig = rt["fig"]
     update = rt["update"]
@@ -886,6 +918,7 @@ def build_gradio_app(fleet_osm_mod: Any, fleet_osm_path: Optional[str]):
         show_battery: bool,
         export_mp4: bool,
         uploaded_map_file: Optional[str],
+        max_task_count: int,
         session_key: str,
     ):
         session_key, ctl = _ensure_control(session_key)
@@ -895,6 +928,7 @@ def build_gradio_app(fleet_osm_mod: Any, fleet_osm_path: Optional[str]):
         ctl["restart"] = False
 
         seed = None if seed_val < 0 else int(seed_val)
+        task_cap = None if max_task_count is None or int(max_task_count) <= 0 else int(max_task_count)
         extra = f"fleet_osm source: {fleet_osm_path or 'import path/auto-detected'}"
 
         try:
@@ -920,6 +954,7 @@ def build_gradio_app(fleet_osm_mod: Any, fleet_osm_path: Optional[str]):
                 use_osm_basemap=bool(use_osm_basemap),
                 show_battery=bool(show_battery),
                 segments_override=segments_override,
+                max_task_count=task_cap,
             )
 
         last_frame = None
@@ -975,6 +1010,7 @@ def build_gradio_app(fleet_osm_mod: Any, fleet_osm_path: Optional[str]):
                     show_battery=bool(show_battery),
                     out_dir=DEFAULT_OUTPUT_DIR,
                     segments_override=segments_override,
+                    max_task_count=task_cap,
                 )
                 fin = live_summary + "\n" + save_summary + "\n" + extra
                 yield last_frame, last_score_img, media_path, fin, session_key
@@ -1002,7 +1038,7 @@ def build_gradio_app(fleet_osm_mod: Any, fleet_osm_path: Optional[str]):
             run_controls[sess_key]["run_token"] = -1
         return (
             strategies[0], scales[0], -1, 0.5, 240, 2, 10, False, False, False, None,
-            None, None, None, gr.update(value="", visible=False), ""
+            -1, None, None, None, gr.update(value="", visible=False), ""
         )
 
     with gr.Blocks(title="智慧物流运输模拟") as demo:
@@ -1021,6 +1057,9 @@ def build_gradio_app(fleet_osm_mod: Any, fleet_osm_path: Optional[str]):
             duration_s = gr.Slider(10, 1800, value=240, step=10, label="动画仿真总时长(秒)")
             steps_per_frame = gr.Slider(1, 8, value=2, step=1, label="每帧推进步数")
             fps = gr.Slider(4, 24, value=10, step=1, label="输出 FPS")
+
+        with gr.Row():
+            max_task_count = gr.Number(value=-1, precision=0, label="任务生成总数上限(-1=不限制)")
 
         use_osm_basemap = gr.Checkbox(value=False, label="尝试加载在线OSM底图(contextily)")
         show_battery = gr.Checkbox(value=False, label="显示车辆电量条")
@@ -1060,6 +1099,7 @@ def build_gradio_app(fleet_osm_mod: Any, fleet_osm_path: Optional[str]):
                 show_battery,
                 export_mp4,
                 uploaded_map_file,
+                max_task_count,
                 session_key,
             ],
             outputs=[preview_canvas, score_curve, download, summary, session_key],
@@ -1085,7 +1125,7 @@ def build_gradio_app(fleet_osm_mod: Any, fleet_osm_path: Optional[str]):
             outputs=[
                 strategy, scale_name, seed_val, dt, duration_s, steps_per_frame, fps,
                 use_osm_basemap, show_battery, export_mp4, uploaded_map_file,
-                preview_canvas, score_curve, download, summary, session_key
+                max_task_count, preview_canvas, score_curve, download, summary, session_key
             ],
             queue=False,
         )
@@ -1106,6 +1146,7 @@ def _self_test(fleet_osm_mod: Any) -> str:
         use_osm_basemap=False,
         show_battery=False,
         out_dir=DEFAULT_OUTPUT_DIR,
+        max_task_count=None,
     )
     return f"{summary}\nfile={media_path}"
 
@@ -1132,6 +1173,14 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+
+
+
+
+
+
 
 
 
